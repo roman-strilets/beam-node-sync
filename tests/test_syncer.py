@@ -4,7 +4,7 @@ import pytest
 
 from src.codec import encode_body_payload, encode_uint
 from src.protocol import MessageType
-from src.protocol_models import BlockHeader, DecodedBlock, TxCounts
+from src.protocol_models import BlockHeader, DecodedBlock, EcPoint, TxCounts, TxInput
 from src.state_store import StateStore
 from src.storage import JsonLineWriter
 from src.syncer import DeriveConfig, SyncConfig, run_derive, run_stage, run_sync
@@ -21,6 +21,14 @@ class _FakeConnection:
 
     def close(self) -> None:
         return None
+
+
+@pytest.fixture(autouse=True)
+def _disable_treasury_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "src.syncer._request_treasury_payload",
+        lambda connection, *, endpoint, timeout: None,
+    )
 
 
 def _header(height: int, previous_hash: str) -> BlockHeader:
@@ -59,6 +67,43 @@ def _empty_body_payload() -> bytes:
 def _empty_body_pack_payload(count: int) -> bytes:
     body = _empty_body_payload()
     return encode_uint(count) + (body * count)
+
+
+def _body_payload_with_input(commitment_x: str, *, y: bool = False) -> bytes:
+    input_bytes = bytes((1 if y else 0,)) + bytes.fromhex(commitment_x)
+    perishable = (b"\x00" * 32) + (1).to_bytes(4, "big") + input_bytes + (0).to_bytes(4, "big")
+    eternal = (0).to_bytes(4, "big")
+    return encode_body_payload(perishable=perishable, eternal=eternal)
+
+
+def _treasury_payload(commitment_x: str, *, incubation: int = 0) -> bytes:
+    output_flags = 0x10 if incubation else 0
+    group = bytearray()
+    group.extend((0).to_bytes(4, "big"))
+    group.extend((1).to_bytes(4, "big"))
+    group.append(output_flags)
+    group.extend(bytes.fromhex(commitment_x))
+    if incubation:
+        group.extend(encode_uint(incubation))
+    group.extend((1).to_bytes(4, "big"))
+    group.append(0)
+    group.extend(b"\x00" * 32)
+    group.extend(b"\x00" * 32)
+    group.extend(b"\x00" * 32)
+    group.extend(b"\x00" * 32)
+    group.extend((0).to_bytes(16, "big"))
+
+    return encode_uint(0) + encode_uint(1) + bytes(group)
+
+
+def _block_with_input(header: BlockHeader, commitment_x: str, *, y: bool = False) -> DecodedBlock:
+    return DecodedBlock(
+        header=header,
+        inputs=[TxInput(commitment=EcPoint(x=commitment_x, y=y))],
+        outputs=[],
+        counts=TxCounts(inputs=1, outputs=0, kernels=0, kernels_mixed=False),
+        offset=None,
+    )
 
 
 def _stage_headers_and_bodies(db_path: Path, heights: int) -> list[BlockHeader]:
@@ -485,3 +530,109 @@ def test_run_sync_fast_sync_uses_stage_then_derive(
     assert result.synced_height == 10
     assert result.outputs_seen == 7
     assert result.duration_seconds == 3.5
+
+
+def test_run_stage_and_derive_use_stored_treasury_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "state.sqlite3"
+    output_path = tmp_path / "utxos.jsonl"
+    treasury_commitment = "aa".rjust(64, "0")
+    header = _header(1, "00" * 32)
+
+    monkeypatch.setattr("src.syncer._open_connection", lambda endpoint, config: _FakeConnection())
+    monkeypatch.setattr("src.syncer._wait_for_tip_header", lambda connection, endpoint, timeout: header)
+    monkeypatch.setattr(
+        "src.syncer._request_treasury_payload",
+        lambda connection, *, endpoint, timeout: _treasury_payload(treasury_commitment),
+    )
+    monkeypatch.setattr(
+        "src.syncer._request_headers",
+        lambda connection, *, endpoint, start_height, stop_height, timeout: [header],
+    )
+    monkeypatch.setattr(
+        "src.syncer._request_body_range_payload",
+        lambda connection, *, endpoint, headers, flag_perishable, flag_eternal, block0, horizon_lo1, horizon_hi1, timeout: (
+            MessageType.BODY,
+            _body_payload_with_input(treasury_commitment),
+        ),
+    )
+
+    stage_result = run_stage(
+        SyncConfig(
+            endpoint=("node.example", 8100),
+            state_db_path=str(db_path),
+            start_height=1,
+            stop_height=1,
+            progress_every=10,
+        )
+    )
+
+    assert stage_result.staged_blocks == 1
+
+    store = StateStore(str(db_path))
+    try:
+        assert store.treasury_payload_hash() is not None
+        assert store.treasury_imported_payload_hash() is None
+    finally:
+        store.close()
+
+    with JsonLineWriter(str(output_path)) as writer:
+        derive_result = run_derive(
+            DeriveConfig(
+                state_db_path=str(db_path),
+                progress_every=10,
+            ),
+            writer,
+        )
+
+    assert derive_result.applied_blocks == 1
+    assert derive_result.resolved_spends == 1
+    assert derive_result.unresolved_spends == 0
+    assert derive_result.exported_utxos == 0
+
+
+def test_run_sync_imports_treasury_before_applying_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "state.sqlite3"
+    output_path = tmp_path / "utxos.jsonl"
+    treasury_commitment = "bb".rjust(64, "0")
+    header = _header(1, "00" * 32)
+
+    monkeypatch.setattr("src.syncer._open_connection", lambda endpoint, config: _FakeConnection())
+    monkeypatch.setattr("src.syncer._wait_for_tip_header", lambda connection, endpoint, timeout: header)
+    monkeypatch.setattr(
+        "src.syncer._request_treasury_payload",
+        lambda connection, *, endpoint, timeout: _treasury_payload(treasury_commitment),
+    )
+    monkeypatch.setattr(
+        "src.syncer._request_headers",
+        lambda connection, *, endpoint, start_height, stop_height, timeout: [header],
+    )
+    monkeypatch.setattr(
+        "src.syncer._request_body",
+        lambda connection, *, endpoint, header, timeout: _block_with_input(
+            header,
+            treasury_commitment,
+        ),
+    )
+
+    with JsonLineWriter(str(output_path)) as writer:
+        result = run_sync(
+            SyncConfig(
+                endpoint=("node.example", 8100),
+                state_db_path=str(db_path),
+                start_height=1,
+                stop_height=1,
+                progress_every=10,
+            ),
+            writer,
+        )
+
+    assert result.applied_blocks == 1
+    assert result.resolved_spends == 1
+    assert result.unresolved_spends == 0
+    assert result.exported_utxos == 0

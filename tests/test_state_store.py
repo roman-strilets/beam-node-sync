@@ -46,6 +46,19 @@ def _empty_body_payload() -> bytes:
     return encode_uint(len(perishable)) + perishable + encode_uint(len(eternal)) + eternal
 
 
+def _treasury_output(tag: str, *, incubation: int = 0) -> BlockOutput:
+    return BlockOutput(
+        commitment=EcPoint(x=tag.rjust(64, "0"), y=False),
+        coinbase=False,
+        recovery_only=False,
+        confidential_proof=None,
+        public_proof=None,
+        incubation=incubation,
+        asset_proof=None,
+        extra_flags=None,
+    )
+
+
 def test_state_store_applies_spends_and_exports_unspent(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite3"
     output_path = tmp_path / "utxos.jsonl"
@@ -353,6 +366,65 @@ def test_run_derive_replays_staged_body_payloads(tmp_path: Path) -> None:
     assert result.unresolved_spends == 0
     assert result.exported_utxos == 0
     assert output_path.read_text(encoding="utf-8") == ""
+
+
+def test_state_store_imports_treasury_outputs_and_reconciles_missing_inputs(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite3"
+
+    store = StateStore(str(db_path))
+    try:
+        treasury_output = _treasury_output("ee")
+        header = _header(1, "00" * 32)
+        block = DecodedBlock(
+            header=header,
+            inputs=[TxInput(commitment=treasury_output.commitment)],
+            outputs=[],
+            counts=TxCounts(inputs=1, outputs=0, kernels=0, kernels_mixed=False),
+            offset=None,
+        )
+
+        stats = store.apply_block(header, block)
+        assert stats.unresolved_spends == 1
+
+        store.store_treasury_payload(
+            b"treasury-payload",
+            payload_sha256="payload-hash",
+            source_node="node-a",
+        )
+        import_stats = store.import_treasury_outputs(
+            [treasury_output],
+            payload_sha256="payload-hash",
+        )
+
+        assert import_stats.inserted_outputs == 1
+        assert import_stats.reconciled_spends == 1
+        assert store.treasury_payload_hash() == "payload-hash"
+        assert store.treasury_imported_payload_hash() == "payload-hash"
+
+        row = store._conn.execute(
+            "SELECT create_height, spent_height, maturity_height FROM outputs"
+        ).fetchone()
+        assert row is not None
+        assert row["create_height"] == 0
+        assert row["spent_height"] == 1
+        assert row["maturity_height"] == 0
+
+        missing = store._conn.execute(
+            "SELECT COUNT(*) AS n FROM missing_inputs"
+        ).fetchone()
+        assert missing is not None
+        assert missing["n"] == 0
+
+        repeated = store.import_treasury_outputs(
+            [treasury_output],
+            payload_sha256="payload-hash",
+        )
+        assert repeated.inserted_outputs == 0
+        assert repeated.reconciled_spends == 0
+    finally:
+        store.close()
 
 
 def test_state_store_tracks_contiguous_staged_height_with_gaps(tmp_path: Path) -> None:

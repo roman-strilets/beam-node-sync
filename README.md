@@ -19,11 +19,12 @@ Current limitations:
 - No full reorg handling.
 - No shielded output tracking.
 - No wallet-readable confidential amounts.
-- Treasury outputs are not reconstructed yet; unresolved early spends are recorded when seen.
+- Treasury bootstrap depends on the connected node exposing the raw treasury payload.
 
 Implementation notes:
 - The local state store treats outputs as a multiset, not a unique-by-commitment map. Beam can carry duplicate commitments, so spends resolve against the newest matching unspent entry.
 - Staged fetch mode stores canonical headers plus raw `Body` or `BodyPack` payloads so later derivation can run locally without talking to a node again.
+- Stage mode also stores the raw treasury payload when the node exposes one, and derive/direct sync seed treasury outputs from it before replay.
 - Stage mode now uses the requested node for both canonical headers and raw block payloads, while still resuming from any already staged headers or block bodies in SQLite.
 - Historical mainnet header hashing uses a baked-in rules-hash table because current peers typically advertise only the active fork hash in their Login payload.
 - In `--fast-sync` mode, historical perishable bodies are requested as Recovery1 payloads with Beam-equivalent horizons (`Hi=1440`, `Lo=4320`) when the requested range is contiguous from the current derived height and the remaining gap is large enough.

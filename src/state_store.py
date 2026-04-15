@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
 from .models import StagedBlockRecord, UtxoExportRecord
 from .protocol import MessageType
-from .protocol_models import BlockHeader, DecodedBlock
+from .protocol_models import BlockHeader, BlockOutput, DecodedBlock
 from .storage import JsonLineWriter
 from .utils import format_commitment
 
 
 COINBASE_MATURITY = 240
+TREASURY_CREATE_BLOCK_HASH = "00" * 32
+TREASURY_IMPORTED_PAYLOAD_SHA256_KEY = "treasury_imported_payload_sha256"
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,14 @@ class ApplyStats:
     inserted_outputs: int
     resolved_spends: int
     unresolved_spends: int
+
+
+@dataclass(frozen=True)
+class TreasuryImportStats:
+    """Treasury bootstrap statistics."""
+
+    inserted_outputs: int
+    reconciled_spends: int
 
 
 class StateStore:
@@ -69,6 +79,7 @@ class StateStore:
                 """
             )
 
+            self._init_treasury_schema()
             self._init_outputs_schema()
             self._init_staged_schema()
 
@@ -102,6 +113,23 @@ class StateStore:
 
             CREATE INDEX IF NOT EXISTS idx_staged_blocks_hash
                 ON staged_blocks(block_hash);
+            """
+        )
+
+    def _init_treasury_schema(self) -> None:
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS state_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS treasury_payload (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                payload_sha256 TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                source_node TEXT NOT NULL
+            );
             """
         )
 
@@ -272,6 +300,66 @@ class StateStore:
             (height,),
         ).fetchone()
         return None if row is None else str(row["hash"])
+
+    def _get_metadata(self, key: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM state_metadata WHERE key = ?",
+            (key,),
+        ).fetchone()
+        return None if row is None else str(row["value"])
+
+    def _set_metadata(self, key: str, value: str) -> None:
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO state_metadata(key, value)
+            VALUES (?, ?)
+            """,
+            (key, value),
+        )
+
+    def treasury_payload_hash(self) -> str | None:
+        row = self._conn.execute(
+            "SELECT payload_sha256 FROM treasury_payload WHERE singleton = 1"
+        ).fetchone()
+        return None if row is None else str(row["payload_sha256"])
+
+    def treasury_payload(self) -> bytes | None:
+        row = self._conn.execute(
+            "SELECT payload FROM treasury_payload WHERE singleton = 1"
+        ).fetchone()
+        return None if row is None else bytes(row["payload"])
+
+    def treasury_imported_payload_hash(self) -> str | None:
+        return self._get_metadata(TREASURY_IMPORTED_PAYLOAD_SHA256_KEY)
+
+    def store_treasury_payload(
+        self,
+        payload: bytes,
+        *,
+        payload_sha256: str,
+        source_node: str,
+    ) -> None:
+        row = self._conn.execute(
+            "SELECT payload_sha256 FROM treasury_payload WHERE singleton = 1"
+        ).fetchone()
+        if row is not None:
+            existing_hash = str(row["payload_sha256"])
+            if existing_hash != payload_sha256:
+                raise RuntimeError(
+                    "stored treasury payload hash mismatch: expected "
+                    f"{existing_hash}, got {payload_sha256}"
+                )
+            return
+
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO treasury_payload (
+                    singleton, payload_sha256, payload, source_node
+                ) VALUES (1, ?, ?, ?)
+                """,
+                (payload_sha256, sqlite3.Binary(payload), source_node),
+            )
 
     @staticmethod
     def _row_to_header(row: sqlite3.Row) -> BlockHeader:
@@ -565,6 +653,119 @@ class StateStore:
                 source_node=str(row["block_source_node"]),
             )
 
+    def _insert_output_record(
+        self,
+        *,
+        commitment: str,
+        commitment_x: str,
+        commitment_y: bool,
+        create_height: int,
+        create_block_hash: str,
+        spent_height: int | None,
+        coinbase: bool,
+        recovery_only: bool,
+        incubation: int,
+        maturity_height: int,
+        has_confidential_proof: bool,
+        has_public_proof: bool,
+        has_asset_proof: bool,
+        extra_flags: int | None,
+    ) -> sqlite3.Cursor:
+        return self._conn.execute(
+            """
+            INSERT INTO outputs (
+                commitment, commitment_x, commitment_y, create_height,
+                create_block_hash, spent_height, coinbase, recovery_only,
+                incubation, maturity_height, has_confidential_proof,
+                has_public_proof, has_asset_proof, extra_flags
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                commitment,
+                commitment_x,
+                1 if commitment_y else 0,
+                create_height,
+                create_block_hash,
+                spent_height,
+                1 if coinbase else 0,
+                1 if recovery_only else 0,
+                incubation,
+                maturity_height,
+                1 if has_confidential_proof else 0,
+                1 if has_public_proof else 0,
+                1 if has_asset_proof else 0,
+                extra_flags,
+            ),
+        )
+
+    def import_treasury_outputs(
+        self,
+        outputs: Sequence[BlockOutput],
+        *,
+        payload_sha256: str,
+    ) -> TreasuryImportStats:
+        imported_hash = self.treasury_imported_payload_hash()
+        if imported_hash is not None:
+            if imported_hash != payload_sha256:
+                raise RuntimeError(
+                    "imported treasury payload hash mismatch: expected "
+                    f"{imported_hash}, got {payload_sha256}"
+                )
+            return TreasuryImportStats(inserted_outputs=0, reconciled_spends=0)
+
+        stored_hash = self.treasury_payload_hash()
+        if stored_hash is not None and stored_hash != payload_sha256:
+            raise RuntimeError(
+                f"stored treasury payload hash mismatch: expected {stored_hash}, got {payload_sha256}"
+            )
+
+        inserted_outputs = 0
+        reconciled_spends = 0
+
+        with self._conn:
+            for output in outputs:
+                commitment = format_commitment(output.commitment)
+                incubation = int(output.incubation or 0)
+                cursor = self._insert_output_record(
+                    commitment=commitment,
+                    commitment_x=output.commitment.x,
+                    commitment_y=output.commitment.y,
+                    create_height=0,
+                    create_block_hash=TREASURY_CREATE_BLOCK_HASH,
+                    spent_height=None,
+                    coinbase=output.coinbase,
+                    recovery_only=output.recovery_only,
+                    incubation=incubation,
+                    maturity_height=incubation,
+                    has_confidential_proof=output.confidential_proof is not None,
+                    has_public_proof=output.public_proof is not None,
+                    has_asset_proof=output.asset_proof is not None,
+                    extra_flags=output.extra_flags,
+                )
+                inserted_outputs += 1
+
+                row = self._conn.execute(
+                    "SELECT MIN(block_height) AS block_height FROM missing_inputs WHERE commitment = ?",
+                    (commitment,),
+                ).fetchone()
+                if row is not None and row["block_height"] is not None:
+                    self._conn.execute(
+                        "UPDATE outputs SET spent_height = ? WHERE output_id = ?",
+                        (int(row["block_height"]), int(cursor.lastrowid)),
+                    )
+                    self._conn.execute(
+                        "DELETE FROM missing_inputs WHERE commitment = ?",
+                        (commitment,),
+                    )
+                    reconciled_spends += 1
+
+            self._set_metadata(TREASURY_IMPORTED_PAYLOAD_SHA256_KEY, payload_sha256)
+
+        return TreasuryImportStats(
+            inserted_outputs=inserted_outputs,
+            reconciled_spends=reconciled_spends,
+        )
+
     def apply_block(self, header: BlockHeader, block: DecodedBlock) -> ApplyStats:
         """Apply one decoded block to the local SQLite state."""
         last_height = self.last_synced_height()
@@ -640,30 +841,21 @@ class StateStore:
                 maturity_height = header.height + incubation + (
                     COINBASE_MATURITY if output.coinbase else 0
                 )
-                self._conn.execute(
-                    """
-                    INSERT INTO outputs (
-                        commitment, commitment_x, commitment_y, create_height,
-                        create_block_hash, spent_height, coinbase, recovery_only,
-                        incubation, maturity_height, has_confidential_proof,
-                        has_public_proof, has_asset_proof, extra_flags
-                    ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        commitment,
-                        output.commitment.x,
-                        1 if output.commitment.y else 0,
-                        header.height,
-                        header.hash,
-                        1 if output.coinbase else 0,
-                        1 if output.recovery_only else 0,
-                        incubation,
-                        maturity_height,
-                        1 if output.confidential_proof is not None else 0,
-                        1 if output.public_proof is not None else 0,
-                        1 if output.asset_proof is not None else 0,
-                        output.extra_flags,
-                    ),
+                self._insert_output_record(
+                    commitment=commitment,
+                    commitment_x=output.commitment.x,
+                    commitment_y=output.commitment.y,
+                    create_height=header.height,
+                    create_block_hash=header.hash,
+                    spent_height=None,
+                    coinbase=output.coinbase,
+                    recovery_only=output.recovery_only,
+                    incubation=incubation,
+                    maturity_height=maturity_height,
+                    has_confidential_proof=output.confidential_proof is not None,
+                    has_public_proof=output.public_proof is not None,
+                    has_asset_proof=output.asset_proof is not None,
+                    extra_flags=output.extra_flags,
                 )
                 inserted_outputs += 1
 

@@ -27,6 +27,11 @@ from .protocol import (
 )
 from .state_store import StateStore
 from .storage import JsonLineWriter
+from .treasury import (
+    deserialize_treasury_payload,
+    extract_body_buffers,
+    treasury_payload_sha256,
+)
 from .utils import format_address
 
 
@@ -357,6 +362,87 @@ def _request_body_payload(
     raise RuntimeError(f"unexpected message while waiting for body: {message_name(message_type)}")
 
 
+def _request_treasury_payload(
+    connection: BeamConnection,
+    *,
+    endpoint: str,
+    timeout: float,
+) -> bytes | None:
+    """Request the node treasury blob, if the network exposes one."""
+    payload = encode_get_body_pack_payload(
+        top_height=0,
+        top_hash=bytes(32),
+        flag_perishable=BODY_FLAG_NONE,
+        flag_eternal=BODY_FLAG_FULL,
+        count_extra=0,
+        block0=0,
+        horizon_lo1=0,
+        horizon_hi1=0,
+    )
+    connection.send(MessageType.GET_BODY_PACK, payload)
+    _log(connection.verbose, f"[*] {endpoint} requested treasury payload")
+
+    try:
+        message_type, response_payload = _recv_until(
+            connection,
+            endpoint=endpoint,
+            expected={MessageType.BODY, MessageType.BODY_PACK},
+            timeout=timeout,
+        )
+    except RuntimeError as exc:
+        if str(exc) == "node reported the requested data is missing":
+            _log(connection.verbose, f"[*] {endpoint} did not provide a treasury payload")
+            return None
+        raise
+
+    perishable, eternal = extract_body_buffers(message_type, response_payload)
+    if perishable:
+        raise RuntimeError("treasury response unexpectedly included a perishable payload")
+    return eternal
+
+
+def _store_treasury_payload_if_needed(
+    connection: BeamConnection,
+    *,
+    endpoint: str,
+    timeout: float,
+    store: StateStore,
+) -> None:
+    if store.treasury_payload_hash() is not None:
+        return
+
+    payload = _request_treasury_payload(
+        connection,
+        endpoint=endpoint,
+        timeout=timeout,
+    )
+    if payload is None:
+        return
+
+    store.store_treasury_payload(
+        payload,
+        payload_sha256=treasury_payload_sha256(payload),
+        source_node=endpoint,
+    )
+
+
+def _import_treasury_outputs_if_needed(store: StateStore) -> None:
+    payload_sha256 = store.treasury_payload_hash()
+    if payload_sha256 is None:
+        return
+    if store.treasury_imported_payload_hash() == payload_sha256:
+        return
+
+    payload = store.treasury_payload()
+    if payload is None:
+        return
+
+    store.import_treasury_outputs(
+        deserialize_treasury_payload(payload),
+        payload_sha256=payload_sha256,
+    )
+
+
 def _request_body_range_payload(
     connection: BeamConnection,
     *,
@@ -523,6 +609,13 @@ def run_stage(config: SyncConfig) -> StageResult:
         target_height = tip_header.height
         if config.stop_height is not None:
             target_height = min(target_height, config.stop_height)
+
+        _store_treasury_payload_if_needed(
+            connection,
+            endpoint=endpoint,
+            timeout=config.request_timeout,
+            store=store,
+        )
 
         _raise_if_start_past_available_height(
             requested_start=requested_start,
@@ -702,6 +795,8 @@ def run_derive(config: DeriveConfig, writer: JsonLineWriter) -> DeriveResult:
         )
         start_height = last_synced_height + 1
 
+        _import_treasury_outputs_if_needed(store)
+
         applied_blocks = 0
         outputs_seen = 0
         resolved_spends = 0
@@ -819,6 +914,14 @@ def run_sync(config: SyncConfig, writer: JsonLineWriter) -> SyncResult:
             state_name="synced state",
         )
         start_height = last_synced_height + 1
+
+        _store_treasury_payload_if_needed(
+            connection,
+            endpoint=endpoint,
+            timeout=config.request_timeout,
+            store=store,
+        )
+        _import_treasury_outputs_if_needed(store)
 
         applied_blocks = 0
         outputs_seen = 0
