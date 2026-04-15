@@ -1,0 +1,17 @@
+[project]
+name = "beam-node-sync"
+version = "0.1.0"
+description = "Trusted Beam node synchronizer that exports the current UTXO set"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+	"cryptography>=41.0",
+	"ecdsa>=0.19",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
