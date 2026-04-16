@@ -6,32 +6,21 @@ import argparse
 import sys
 
 from src.protocol import DEFAULT_CONNECT_TIMEOUT, DEFAULT_PORT, DEFAULT_REQUEST_TIMEOUT
-from src.storage import JsonLineWriter
-from src.syncer import DeriveConfig, SyncConfig, run_derive, run_stage, run_sync
+from src.syncer import SyncConfig, run_staged
 from src.utils import parse_endpoint, parse_fork_hashes
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Parse command-line arguments and run the Beam sync/export flow."""
+    """Parse command-line arguments and run the Beam sync flow."""
     parser = argparse.ArgumentParser(
         description=(
-            "Synchronize Beam regular outputs from a trusted node, or stage raw "
-            "blocks first and derive the UTXO set in a separate pass"
+            "Stage Beam raw blocks from a trusted node and derive the regular-output "
+            "state into SQLite"
         )
     )
     parser.add_argument(
         "node",
-        nargs="?",
-        help="Beam node address as host or host:port (required for direct, stage, and staged modes)",
-    )
-    parser.add_argument(
-        "--mode",
-        choices=("direct", "stage", "derive", "staged"),
-        default="direct",
-        help=(
-            "direct: fetch and derive in one pass; stage: persist raw headers and bodies only; "
-            "derive: replay staged data into the UTXO state; staged: run stage then derive"
-        ),
+        help="Beam node address as host or host:port",
     )
     parser.add_argument(
         "--state-db",
@@ -52,8 +41,7 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         metavar="HEIGHT",
         help=(
-            "stop after staging or deriving this block height instead of using the "
-            "current node tip or max staged height"
+            "stop after processing this block height instead of using the current node tip"
         ),
     )
     parser.add_argument(
@@ -85,8 +73,8 @@ def main(argv: list[str] | None = None) -> int:
         "--fast-sync",
         action="store_true",
         help=(
-            "use Beam-style sparse historical body fetches when syncing a contiguous "
-            "range from the current local state"
+            "use Beam-style sparse historical body fetches during the staging phase "
+            "when syncing a contiguous range from the current local state"
         ),
     )
     parser.add_argument(
@@ -95,11 +83,6 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         metavar="HEX",
         help="fork config hash (64 hex chars); repeat per fork",
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
-        help="write exported UTXOs to this JSONL file instead of stdout",
     )
     parser.add_argument(
         "-v",
@@ -125,88 +108,11 @@ def main(argv: list[str] | None = None) -> int:
         and args.start_height > args.stop_height
     ):
         parser.error("start-height must be <= stop-height")
-    if args.mode in {"direct", "stage", "staged"} and args.node is None:
-        parser.error("node is required for direct, stage, and staged modes")
-    if args.mode == "stage" and args.output is not None:
-        parser.error("--output is only valid for direct, derive, and staged modes")
 
     try:
-        endpoint = parse_endpoint(args.node, DEFAULT_PORT) if args.node is not None else None
+        endpoint = parse_endpoint(args.node, DEFAULT_PORT)
         fork_hashes = parse_fork_hashes(args.fork_hash)
-
-        if args.mode == "direct":
-            with JsonLineWriter(args.output) as writer:
-                result = run_sync(
-                    SyncConfig(
-                        endpoint=endpoint,
-                        state_db_path=args.state_db,
-                        connect_timeout=args.connect_timeout,
-                        request_timeout=args.request_timeout,
-                        fork_hashes=fork_hashes,
-                        start_height=args.start_height,
-                        stop_height=args.stop_height,
-                        progress_every=args.progress_every,
-                        fast_sync=args.fast_sync,
-                        verbose=args.verbose,
-                    ),
-                    writer,
-                )
-
-            print(
-                f"synced height={result.synced_height}/{result.target_height} "
-                f"from {result.node}; applied_blocks={result.applied_blocks}, "
-                f"outputs={result.outputs_seen}, resolved_spends={result.resolved_spends}, "
-                f"unresolved_spends={result.unresolved_spends}, exported_utxos={result.exported_utxos}, "
-                f"elapsed={result.duration_seconds:.2f}s",
-                file=sys.stderr,
-            )
-            return 0
-
-        if args.mode == "stage":
-            result = run_stage(
-                SyncConfig(
-                    endpoint=endpoint,
-                    state_db_path=args.state_db,
-                    connect_timeout=args.connect_timeout,
-                    request_timeout=args.request_timeout,
-                    fork_hashes=fork_hashes,
-                    start_height=args.start_height,
-                    stop_height=args.stop_height,
-                    progress_every=args.progress_every,
-                        fast_sync=args.fast_sync,
-                    verbose=args.verbose,
-                )
-            )
-            print(
-                f"staged height={result.staged_height}/{result.target_height} "
-                f"from {result.node}; staged_blocks={result.staged_blocks}, "
-                f"elapsed={result.duration_seconds:.2f}s",
-                file=sys.stderr,
-            )
-            return 0
-
-        if args.mode == "derive":
-            with JsonLineWriter(args.output) as writer:
-                result = run_derive(
-                    DeriveConfig(
-                        state_db_path=args.state_db,
-                        start_height=args.start_height,
-                        stop_height=args.stop_height,
-                        progress_every=args.progress_every,
-                    ),
-                    writer,
-                )
-
-            print(
-                f"derived height={result.synced_height}/{result.target_height}; "
-                f"applied_blocks={result.applied_blocks}, outputs={result.outputs_seen}, "
-                f"resolved_spends={result.resolved_spends}, unresolved_spends={result.unresolved_spends}, "
-                f"exported_utxos={result.exported_utxos}, elapsed={result.duration_seconds:.2f}s",
-                file=sys.stderr,
-            )
-            return 0
-
-        stage_result = run_stage(
+        stage_result, derive_result = run_staged(
             SyncConfig(
                 endpoint=endpoint,
                 state_db_path=args.state_db,
@@ -220,16 +126,6 @@ def main(argv: list[str] | None = None) -> int:
                 verbose=args.verbose,
             )
         )
-        with JsonLineWriter(args.output) as writer:
-            derive_result = run_derive(
-                DeriveConfig(
-                    state_db_path=args.state_db,
-                    start_height=args.start_height,
-                    stop_height=args.stop_height,
-                    progress_every=args.progress_every,
-                ),
-                writer,
-            )
 
         print(
             f"staged height={stage_result.staged_height}/{stage_result.target_height} "
@@ -242,7 +138,6 @@ def main(argv: list[str] | None = None) -> int:
             f"applied_blocks={derive_result.applied_blocks}, outputs={derive_result.outputs_seen}, "
             f"resolved_spends={derive_result.resolved_spends}, "
             f"unresolved_spends={derive_result.unresolved_spends}, "
-            f"exported_utxos={derive_result.exported_utxos}, "
             f"derive_elapsed={derive_result.duration_seconds:.2f}s",
             file=sys.stderr,
         )

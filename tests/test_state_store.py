@@ -377,6 +377,33 @@ def test_run_derive_replays_staged_body_payloads(tmp_path: Path) -> None:
         store.close()
 
 
+def test_state_store_apply_block_marks_staged_header_as_applied(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite3"
+
+    store = StateStore(str(db_path))
+    try:
+        header = _header(1, "00" * 32)
+        block = DecodedBlock(
+            header=header,
+            inputs=[],
+            outputs=[],
+            counts=TxCounts(inputs=0, outputs=0, kernels=0, kernels_mixed=False),
+            offset=None,
+        )
+
+        store.stage_header(header, source_node="node-a")
+        store.apply_block(header, block)
+
+        row = store._conn.execute(
+            "SELECT source_node, applied FROM headers WHERE height = 1"
+        ).fetchone()
+        assert row is not None
+        assert row["source_node"] == "node-a"
+        assert row["applied"] == 1
+    finally:
+        store.close()
+
+
 def test_state_store_imports_treasury_outputs_and_reconciles_missing_inputs(
     tmp_path: Path,
 ) -> None:
@@ -524,3 +551,208 @@ def test_state_store_supports_sparse_staged_header_ranges(tmp_path: Path) -> Non
         assert [record.header.height for record in staged] == [3, 4, 5]
     finally:
         store.close()
+
+
+def test_state_store_migrates_legacy_staged_headers_into_headers(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite3"
+    body_payload = _empty_body_payload()
+    header1 = _header(1, "00" * 32)
+    header2 = _header(2, header1.hash)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE headers (
+                height INTEGER PRIMARY KEY,
+                hash TEXT NOT NULL,
+                previous_hash TEXT NOT NULL,
+                chainwork TEXT NOT NULL,
+                kernels TEXT NOT NULL,
+                definition TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                packed_difficulty INTEGER NOT NULL,
+                difficulty REAL NOT NULL,
+                rules_hash TEXT,
+                pow_indices_hex TEXT NOT NULL,
+                pow_nonce_hex TEXT NOT NULL
+            );
+
+            CREATE TABLE staged_headers (
+                height INTEGER PRIMARY KEY,
+                hash TEXT NOT NULL,
+                previous_hash TEXT NOT NULL,
+                chainwork TEXT NOT NULL,
+                kernels TEXT NOT NULL,
+                definition TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                packed_difficulty INTEGER NOT NULL,
+                difficulty REAL NOT NULL,
+                rules_hash TEXT,
+                pow_indices_hex TEXT NOT NULL,
+                pow_nonce_hex TEXT NOT NULL,
+                source_node TEXT NOT NULL
+            );
+
+            CREATE TABLE staged_blocks (
+                height INTEGER PRIMARY KEY,
+                block_hash TEXT NOT NULL,
+                message_type INTEGER NOT NULL,
+                payload BLOB NOT NULL,
+                source_node TEXT NOT NULL,
+                FOREIGN KEY(height) REFERENCES staged_headers(height)
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO headers (
+                height,
+                hash,
+                previous_hash,
+                chainwork,
+                kernels,
+                definition,
+                timestamp,
+                packed_difficulty,
+                difficulty,
+                rules_hash,
+                pow_indices_hex,
+                pow_nonce_hex
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                header1.height,
+                header1.hash,
+                header1.previous_hash,
+                header1.chainwork,
+                header1.kernels,
+                header1.definition,
+                header1.timestamp,
+                header1.packed_difficulty,
+                header1.difficulty,
+                header1.rules_hash,
+                header1.pow_indices_hex,
+                header1.pow_nonce_hex,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO staged_headers (
+                height,
+                hash,
+                previous_hash,
+                chainwork,
+                kernels,
+                definition,
+                timestamp,
+                packed_difficulty,
+                difficulty,
+                rules_hash,
+                pow_indices_hex,
+                pow_nonce_hex,
+                source_node
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                header1.height,
+                header1.hash,
+                header1.previous_hash,
+                header1.chainwork,
+                header1.kernels,
+                header1.definition,
+                header1.timestamp,
+                header1.packed_difficulty,
+                header1.difficulty,
+                header1.rules_hash,
+                header1.pow_indices_hex,
+                header1.pow_nonce_hex,
+                "node-a",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO staged_headers (
+                height,
+                hash,
+                previous_hash,
+                chainwork,
+                kernels,
+                definition,
+                timestamp,
+                packed_difficulty,
+                difficulty,
+                rules_hash,
+                pow_indices_hex,
+                pow_nonce_hex,
+                source_node
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                header2.height,
+                header2.hash,
+                header2.previous_hash,
+                header2.chainwork,
+                header2.kernels,
+                header2.definition,
+                header2.timestamp,
+                header2.packed_difficulty,
+                header2.difficulty,
+                header2.rules_hash,
+                header2.pow_indices_hex,
+                header2.pow_nonce_hex,
+                "node-b",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO staged_blocks (
+                height,
+                block_hash,
+                message_type,
+                payload,
+                source_node
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                header2.height,
+                header2.hash,
+                int(MessageType.BODY),
+                sqlite3.Binary(body_payload),
+                "node-b",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = StateStore(str(db_path))
+    try:
+        assert not store._table_exists("staged_headers")
+
+        rows = store._conn.execute(
+            "SELECT height, source_node, applied FROM headers ORDER BY height ASC"
+        ).fetchall()
+        assert len(rows) == 2
+        assert rows[0]["height"] == 1
+        assert rows[0]["source_node"] == "node-a"
+        assert rows[0]["applied"] == 1
+        assert rows[1]["height"] == 2
+        assert rows[1]["source_node"] == "node-b"
+        assert rows[1]["applied"] == 0
+
+        assert store.last_synced_height() == 1
+        assert store.last_staged_header_height() == 2
+        assert store.last_staged_height() == 2
+
+        foreign_keys = list(store._conn.execute("PRAGMA foreign_key_list(staged_blocks)"))
+        assert len(foreign_keys) == 1
+        assert foreign_keys[0]["table"] == "headers"
+    finally:
+        store.close()
+
+    result = run_derive(DeriveConfig(state_db_path=str(db_path), progress_every=10))
+
+    assert result.target_height == 2
+    assert result.synced_height == 2
+    assert result.applied_blocks == 1

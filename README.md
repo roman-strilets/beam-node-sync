@@ -4,8 +4,8 @@ This tool performs a trusted-node Beam sync in pure Python and persists the
 derived regular-output state in SQLite.
 
 Current scope:
-- Single staged pipeline that stores raw headers and block body payloads in SQLite,
-	then replays them locally into the derived UTXO state.
+- Single staged pipeline that stores canonical headers in SQLite alongside staged
+	raw block body payloads, then replays them locally into the derived UTXO state.
 - Inclusive `--start-height` and `--stop-height` bounds for resumed work.
 - Optional `--fast-sync` mode that requests sparse historical bodies during the
 	staging phase using Beam's `GetBodyPack` horizons, then replays them locally.
@@ -22,9 +22,10 @@ Current limitations:
 
 Implementation notes:
 - The local state store treats outputs as a multiset, not a unique-by-commitment map. Beam can carry duplicate commitments, so spends resolve against the newest matching unspent entry.
-- The staging phase stores canonical headers plus raw `Body` or `BodyPack` payloads so the derive phase can replay them locally without talking to a node again.
+- The canonical header catalog lives in the SQLite `headers` table; staged rows are marked until they are applied, so one table covers both fetched and derived header state.
+- Raw `Body` or `BodyPack` payloads remain in the SQLite `staged_blocks` table so the derive phase can replay them locally without talking to a node again.
 - The staging phase also stores the raw treasury payload when the node exposes one, and the derive phase seeds treasury outputs from it before replay.
-- The staging phase uses the requested node for both canonical headers and raw block payloads, while still resuming from any already staged headers or block bodies in SQLite.
+- The staging phase uses the requested node for both canonical headers and raw block payloads, while still resuming from any already known headers or staged block bodies in SQLite.
 - Historical mainnet header hashing uses a baked-in rules-hash table because current peers typically advertise only the active fork hash in their Login payload.
 - In `--fast-sync` mode, historical perishable bodies are requested as Recovery1 payloads with Beam-equivalent horizons (`Hi=1440`, `Lo=4320`) when the requested range is contiguous from the current derived height and the remaining gap is large enough.
 - The CLI always runs both phases; stage-only raw capture and derive-only replay are no longer exposed as separate commands.
