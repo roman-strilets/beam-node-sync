@@ -6,8 +6,7 @@ from src.codec import encode_body_payload, encode_uint
 from src.protocol import MessageType
 from src.protocol_models import BlockHeader, DecodedBlock, EcPoint, TxCounts, TxInput
 from src.state_store import StateStore
-from src.storage import JsonLineWriter
-from src.syncer import DeriveConfig, SyncConfig, run_derive, run_stage, run_sync
+from src.syncer import DeriveConfig, SyncConfig, run_derive, run_stage, run_staged
 
 
 class _FakeConnection:
@@ -127,12 +126,11 @@ def _stage_headers_and_bodies(db_path: Path, heights: int) -> list[BlockHeader]:
     return headers
 
 
-def test_run_sync_rejects_start_height_past_resume_floor(
+def test_run_staged_rejects_start_height_past_resume_floor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db_path = tmp_path / "state.sqlite3"
-    output_path = tmp_path / "utxos.jsonl"
 
     store = StateStore(str(db_path))
     try:
@@ -141,22 +139,21 @@ def test_run_sync_rejects_start_height_past_resume_floor(
     finally:
         store.close()
 
-    header2 = _header(2, header1.hash)
-    header3 = _header(3, header2.hash)
+    def fail_run_stage(_config: SyncConfig):
+        raise AssertionError(
+            "run_staged should reject an impossible derive resume before staging"
+        )
 
-    monkeypatch.setattr("src.syncer._open_connection", lambda endpoint, config: _FakeConnection())
-    monkeypatch.setattr("src.syncer._wait_for_tip_header", lambda connection, endpoint, timeout: header3)
+    monkeypatch.setattr("src.syncer.run_stage", fail_run_stage)
 
-    with JsonLineWriter(str(output_path)) as writer:
-        with pytest.raises(RuntimeError, match="can only continue from height 2"):
-            run_sync(
-                SyncConfig(
-                    endpoint=("node.example", 8100),
-                    state_db_path=str(db_path),
-                    start_height=3,
-                ),
-                writer,
+    with pytest.raises(RuntimeError, match="can only continue from height 2"):
+        run_staged(
+            SyncConfig(
+                endpoint=("node.example", 8100),
+                state_db_path=str(db_path),
+                start_height=3,
             )
+        )
 
 
 def test_run_stage_allows_fresh_sparse_range(
@@ -385,57 +382,8 @@ def test_run_stage_fast_sync_uses_sparse_then_full_body_ranges(
     assert result.staged_blocks == 6
 
 
-def test_run_sync_batches_header_requests(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    db_path = tmp_path / "state.sqlite3"
-    output_path = tmp_path / "utxos.jsonl"
-    requested_header_ranges: list[tuple[int, int]] = []
-
-    tip_header = _header(3, f"{2:064x}")
-
-    monkeypatch.setattr("src.syncer._open_connection", lambda endpoint, config: _FakeConnection())
-    monkeypatch.setattr("src.syncer._wait_for_tip_header", lambda connection, endpoint, timeout: tip_header)
-    monkeypatch.setattr("src.syncer.HEADER_REQUEST_BATCH_SIZE", 2)
-
-    def fake_request_headers(connection, *, endpoint, start_height, stop_height, timeout):
-        requested_header_ranges.append((start_height, stop_height))
-        previous_hash = "00" * 32 if start_height == 1 else f"{start_height - 1:064x}"
-        headers: list[BlockHeader] = []
-        for height in range(start_height, stop_height + 1):
-            header = _header(height, previous_hash)
-            headers.append(header)
-            previous_hash = header.hash
-        return headers
-
-    def fake_request_body(connection, *, endpoint, header, timeout):
-        return _empty_block(header)
-
-    monkeypatch.setattr("src.syncer._request_headers", fake_request_headers)
-    monkeypatch.setattr("src.syncer._request_body", fake_request_body)
-
-    with JsonLineWriter(str(output_path)) as writer:
-        result = run_sync(
-            SyncConfig(
-                endpoint=("node.example", 8100),
-                state_db_path=str(db_path),
-                start_height=1,
-                stop_height=3,
-                progress_every=10,
-            ),
-            writer,
-        )
-
-    assert requested_header_ranges == [(1, 2), (3, 3)]
-    assert result.target_height == 3
-    assert result.synced_height == 3
-    assert result.applied_blocks == 3
-
-
 def test_run_derive_clamps_start_height_to_next_synced_height(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite3"
-    output_path = tmp_path / "utxos.jsonl"
     headers = _stage_headers_and_bodies(db_path, heights=3)
 
     store = StateStore(str(db_path))
@@ -444,16 +392,14 @@ def test_run_derive_clamps_start_height_to_next_synced_height(tmp_path: Path) ->
     finally:
         store.close()
 
-    with JsonLineWriter(str(output_path)) as writer:
-        result = run_derive(
-            DeriveConfig(
-                state_db_path=str(db_path),
-                start_height=1,
-                stop_height=3,
-                progress_every=10,
-            ),
-            writer,
+    result = run_derive(
+        DeriveConfig(
+            state_db_path=str(db_path),
+            start_height=1,
+            stop_height=3,
+            progress_every=10,
         )
+    )
 
     assert result.target_height == 3
     assert result.synced_height == 3
@@ -462,7 +408,6 @@ def test_run_derive_clamps_start_height_to_next_synced_height(tmp_path: Path) ->
 
 def test_run_derive_rejects_start_height_past_resume_floor(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite3"
-    output_path = tmp_path / "utxos.jsonl"
     headers = _stage_headers_and_bodies(db_path, heights=3)
 
     store = StateStore(str(db_path))
@@ -471,24 +416,23 @@ def test_run_derive_rejects_start_height_past_resume_floor(tmp_path: Path) -> No
     finally:
         store.close()
 
-    with JsonLineWriter(str(output_path)) as writer:
-        with pytest.raises(RuntimeError, match="can only continue from height 2"):
-            run_derive(
-                DeriveConfig(
-                    state_db_path=str(db_path),
-                    start_height=3,
-                    stop_height=3,
-                    progress_every=10,
-                ),
-                writer,
+    with pytest.raises(RuntimeError, match="can only continue from height 2"):
+        run_derive(
+            DeriveConfig(
+                state_db_path=str(db_path),
+                start_height=3,
+                stop_height=3,
+                progress_every=10,
             )
+        )
 
 
-def test_run_sync_fast_sync_uses_stage_then_derive(
+def test_run_staged_uses_stage_then_derive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stage_calls: list[SyncConfig] = []
+    derive_calls: list[DeriveConfig] = []
 
     def fake_run_stage(config: SyncConfig):
         stage_calls.append(config)
@@ -500,7 +444,8 @@ def test_run_sync_fast_sync_uses_stage_then_derive(
             "duration_seconds": 1.5,
         })()
 
-    def fake_run_derive(config: DeriveConfig, writer: JsonLineWriter):
+    def fake_run_derive(config: DeriveConfig):
+        derive_calls.append(config)
         return type("_DeriveResult", (), {
             "target_height": 10,
             "synced_height": 10,
@@ -508,28 +453,33 @@ def test_run_sync_fast_sync_uses_stage_then_derive(
             "outputs_seen": 7,
             "resolved_spends": 5,
             "unresolved_spends": 1,
-            "exported_utxos": 3,
             "duration_seconds": 2.0,
         })()
 
     monkeypatch.setattr("src.syncer.run_stage", fake_run_stage)
     monkeypatch.setattr("src.syncer.run_derive", fake_run_derive)
 
-    with JsonLineWriter(str(tmp_path / "utxos.jsonl")) as writer:
-        result = run_sync(
-            SyncConfig(
-                endpoint=("node.example", 8100),
-                state_db_path=str(tmp_path / "state.sqlite3"),
-                fast_sync=True,
-            ),
-            writer,
+    stage_result, derive_result = run_staged(
+        SyncConfig(
+            endpoint=("node.example", 8100),
+            state_db_path=str(tmp_path / "state.sqlite3"),
+            start_height=1,
+            stop_height=10,
+            progress_every=25,
+            fast_sync=True,
         )
+    )
 
     assert len(stage_calls) == 1
-    assert result.node == "node.example:8100"
-    assert result.synced_height == 10
-    assert result.outputs_seen == 7
-    assert result.duration_seconds == 3.5
+    assert stage_calls[0].fast_sync is True
+    assert len(derive_calls) == 1
+    assert derive_calls[0].state_db_path == str(tmp_path / "state.sqlite3")
+    assert derive_calls[0].start_height == 1
+    assert derive_calls[0].stop_height == 10
+    assert derive_calls[0].progress_every == 25
+    assert stage_result.node == "node.example:8100"
+    assert derive_result.synced_height == 10
+    assert derive_result.outputs_seen == 7
 
 
 def test_run_stage_and_derive_use_stored_treasury_payload(
@@ -537,7 +487,6 @@ def test_run_stage_and_derive_use_stored_treasury_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db_path = tmp_path / "state.sqlite3"
-    output_path = tmp_path / "utxos.jsonl"
     treasury_commitment = "aa".rjust(64, "0")
     header = _header(1, "00" * 32)
 
@@ -578,61 +527,13 @@ def test_run_stage_and_derive_use_stored_treasury_payload(
     finally:
         store.close()
 
-    with JsonLineWriter(str(output_path)) as writer:
-        derive_result = run_derive(
-            DeriveConfig(
-                state_db_path=str(db_path),
-                progress_every=10,
-            ),
-            writer,
+    derive_result = run_derive(
+        DeriveConfig(
+            state_db_path=str(db_path),
+            progress_every=10,
         )
+    )
 
     assert derive_result.applied_blocks == 1
     assert derive_result.resolved_spends == 1
     assert derive_result.unresolved_spends == 0
-    assert derive_result.exported_utxos == 0
-
-
-def test_run_sync_imports_treasury_before_applying_blocks(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    db_path = tmp_path / "state.sqlite3"
-    output_path = tmp_path / "utxos.jsonl"
-    treasury_commitment = "bb".rjust(64, "0")
-    header = _header(1, "00" * 32)
-
-    monkeypatch.setattr("src.syncer._open_connection", lambda endpoint, config: _FakeConnection())
-    monkeypatch.setattr("src.syncer._wait_for_tip_header", lambda connection, endpoint, timeout: header)
-    monkeypatch.setattr(
-        "src.syncer._request_treasury_payload",
-        lambda connection, *, endpoint, timeout: _treasury_payload(treasury_commitment),
-    )
-    monkeypatch.setattr(
-        "src.syncer._request_headers",
-        lambda connection, *, endpoint, start_height, stop_height, timeout: [header],
-    )
-    monkeypatch.setattr(
-        "src.syncer._request_body",
-        lambda connection, *, endpoint, header, timeout: _block_with_input(
-            header,
-            treasury_commitment,
-        ),
-    )
-
-    with JsonLineWriter(str(output_path)) as writer:
-        result = run_sync(
-            SyncConfig(
-                endpoint=("node.example", 8100),
-                state_db_path=str(db_path),
-                start_height=1,
-                stop_height=1,
-                progress_every=10,
-            ),
-            writer,
-        )
-
-    assert result.applied_blocks == 1
-    assert result.resolved_spends == 1
-    assert result.unresolved_spends == 0
-    assert result.exported_utxos == 0

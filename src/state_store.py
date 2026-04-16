@@ -7,10 +7,9 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from .models import StagedBlockRecord, UtxoExportRecord
+from .models import StagedBlockRecord
 from .protocol import MessageType
 from .protocol_models import BlockHeader, BlockOutput, DecodedBlock
-from .storage import JsonLineWriter
 from .utils import format_commitment
 
 
@@ -864,47 +863,3 @@ class StateStore:
             resolved_spends=resolved_spends,
             unresolved_spends=unresolved_spends,
         )
-
-    def export_unspent(self, writer: JsonLineWriter, tip_height: int) -> int:
-        """Write the current unspent output set to ``writer`` as JSON lines."""
-        count = 0
-        rows = self._conn.execute(
-            """
-            SELECT
-                commitment,
-                commitment_x,
-                commitment_y,
-                create_height,
-                maturity_height,
-                coinbase,
-                recovery_only,
-                incubation,
-                has_confidential_proof,
-                has_public_proof,
-                has_asset_proof,
-                extra_flags
-            FROM outputs
-            WHERE spent_height IS NULL
-            ORDER BY create_height ASC, output_id ASC
-            """
-        )
-        for row in rows:
-            writer.write(
-                UtxoExportRecord(
-                    commitment=str(row["commitment"]),
-                    commitment_x=str(row["commitment_x"]),
-                    commitment_y=bool(row["commitment_y"]),
-                    create_height=int(row["create_height"]),
-                    maturity_height=int(row["maturity_height"]),
-                    mature=tip_height >= int(row["maturity_height"]),
-                    coinbase=bool(row["coinbase"]),
-                    recovery_only=bool(row["recovery_only"]),
-                    incubation=int(row["incubation"]),
-                    has_confidential_proof=bool(row["has_confidential_proof"]),
-                    has_public_proof=bool(row["has_public_proof"]),
-                    has_asset_proof=bool(row["has_asset_proof"]),
-                    extra_flags=row["extra_flags"],
-                )
-            )
-            count += 1
-        return count

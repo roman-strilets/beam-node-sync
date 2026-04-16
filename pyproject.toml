@@ -1,7 +1,7 @@
 [project]
 name = "beam-node-sync"
 version = "0.1.0"
-description = "Trusted Beam node synchronizer that exports the current UTXO set"
+description = "Trusted Beam node staged synchronizer that derives local regular-output state"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

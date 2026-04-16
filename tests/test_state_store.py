@@ -5,7 +5,6 @@ from src.codec import encode_uint
 from src.protocol import MessageType
 from src.protocol_models import BlockHeader, BlockOutput, DecodedBlock, EcPoint, TxCounts, TxInput
 from src.state_store import COINBASE_MATURITY, StateStore
-from src.storage import JsonLineWriter
 from src.syncer import DeriveConfig, run_derive
 from src.utils import format_commitment
 
@@ -59,9 +58,8 @@ def _treasury_output(tag: str, *, incubation: int = 0) -> BlockOutput:
     )
 
 
-def test_state_store_applies_spends_and_exports_unspent(tmp_path: Path) -> None:
+def test_state_store_applies_spends_and_tracks_unspent_outputs(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite3"
-    output_path = tmp_path / "utxos.jsonl"
 
     store = StateStore(str(db_path))
     try:
@@ -93,21 +91,24 @@ def test_state_store_applies_spends_and_exports_unspent(tmp_path: Path) -> None:
         assert stats2.resolved_spends == 1
         assert stats2.unresolved_spends == 0
 
-        with JsonLineWriter(str(output_path)) as writer:
-            exported = store.export_unspent(writer, tip_height=header2.height)
+        rows = store._conn.execute(
+            """
+            SELECT commitment, create_height
+            FROM outputs
+            WHERE spent_height IS NULL
+            ORDER BY output_id ASC
+            """
+        ).fetchall()
 
-        assert exported == 1
-        lines = output_path.read_text(encoding="utf-8").strip().splitlines()
-        assert len(lines) == 1
-        assert format_commitment(second_output.commitment) in lines[0]
-        assert format_commitment(first_output.commitment) not in lines[0]
+        assert len(rows) == 1
+        assert rows[0]["create_height"] == header2.height
+        assert rows[0]["commitment"] == format_commitment(second_output.commitment)
     finally:
         store.close()
 
 
 def test_state_store_computes_coinbase_maturity_height(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite3"
-    output_path = tmp_path / "utxos.jsonl"
 
     store = StateStore(str(db_path))
     try:
@@ -122,12 +123,12 @@ def test_state_store_computes_coinbase_maturity_height(tmp_path: Path) -> None:
         )
         store.apply_block(header, block)
 
-        with JsonLineWriter(str(output_path)) as writer:
-            store.export_unspent(writer, tip_height=header.height)
-
-        text = output_path.read_text(encoding="utf-8")
-        assert f'"maturity_height":{header.height + COINBASE_MATURITY + 2}' in text
-        assert '"mature":false' in text
+        row = store._conn.execute(
+            "SELECT maturity_height, spent_height FROM outputs"
+        ).fetchone()
+        assert row is not None
+        assert row["maturity_height"] == header.height + COINBASE_MATURITY + 2
+        assert row["spent_height"] is None
     finally:
         store.close()
 
@@ -136,7 +137,6 @@ def test_state_store_supports_duplicate_commitments_with_lifo_spends(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "state.sqlite3"
-    output_path = tmp_path / "utxos.jsonl"
 
     store = StateStore(str(db_path))
     try:
@@ -197,14 +197,21 @@ def test_state_store_supports_duplicate_commitments_with_lifo_spends(
         assert stats3.resolved_spends == 1
         assert stats3.unresolved_spends == 0
 
-        with JsonLineWriter(str(output_path)) as writer:
-            exported = store.export_unspent(writer, tip_height=header3.height)
+        rows = store._conn.execute(
+            """
+            SELECT commitment, create_height, spent_height
+            FROM outputs
+            WHERE commitment = ?
+            ORDER BY output_id ASC
+            """,
+            (format_commitment(duplicate),),
+        ).fetchall()
 
-        assert exported == 1
-        lines = output_path.read_text(encoding="utf-8").strip().splitlines()
-        assert len(lines) == 1
-        assert '"create_height":1' in lines[0]
-        assert '"commitment":"' + format_commitment(duplicate) + '"' in lines[0]
+        assert len(rows) == 2
+        assert rows[0]["create_height"] == 1
+        assert rows[0]["spent_height"] is None
+        assert rows[1]["create_height"] == 2
+        assert rows[1]["spent_height"] == 3
     finally:
         store.close()
 
@@ -328,7 +335,6 @@ def test_state_store_stages_block_payloads_in_order(tmp_path: Path) -> None:
 
 def test_run_derive_replays_staged_body_payloads(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite3"
-    output_path = tmp_path / "utxos.jsonl"
     body_payload = _empty_body_payload()
 
     store = StateStore(str(db_path))
@@ -352,11 +358,7 @@ def test_run_derive_replays_staged_body_payloads(tmp_path: Path) -> None:
     finally:
         store.close()
 
-    with JsonLineWriter(str(output_path)) as writer:
-        result = run_derive(
-            DeriveConfig(state_db_path=str(db_path), progress_every=10),
-            writer,
-        )
+    result = run_derive(DeriveConfig(state_db_path=str(db_path), progress_every=10))
 
     assert result.target_height == 2
     assert result.synced_height == 2
@@ -364,8 +366,15 @@ def test_run_derive_replays_staged_body_payloads(tmp_path: Path) -> None:
     assert result.outputs_seen == 0
     assert result.resolved_spends == 0
     assert result.unresolved_spends == 0
-    assert result.exported_utxos == 0
-    assert output_path.read_text(encoding="utf-8") == ""
+
+    store = StateStore(str(db_path))
+    try:
+        assert store.last_synced_height() == 2
+        row = store._conn.execute("SELECT COUNT(*) AS n FROM outputs").fetchone()
+        assert row is not None
+        assert row["n"] == 0
+    finally:
+        store.close()
 
 
 def test_state_store_imports_treasury_outputs_and_reconciles_missing_inputs(

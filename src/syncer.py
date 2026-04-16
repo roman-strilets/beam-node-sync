@@ -10,14 +10,13 @@ from dataclasses import dataclass, field
 from .codec import encode_body_payload, encode_get_body_pack_payload, encode_height_range
 from .connection import BeamConnection
 from .deserializers import (
-    deserialize_body_pack_payloads,
     deserialize_body_pack_payload,
     deserialize_body_payload,
     deserialize_header_pack_payloads,
     deserialize_new_tip_payload,
     split_body_pack_payload,
 )
-from .models import DeriveResult, StageResult, SyncResult
+from .models import DeriveResult, StageResult
 from .protocol import (
     Address,
     DEFAULT_CONNECT_TIMEOUT,
@@ -26,7 +25,6 @@ from .protocol import (
     message_name,
 )
 from .state_store import StateStore
-from .storage import JsonLineWriter
 from .treasury import (
     deserialize_treasury_payload,
     extract_body_buffers,
@@ -47,7 +45,7 @@ BEAM_FAST_SYNC_TRIGGER_GAP = BEAM_FAST_SYNC_HI + (BEAM_FAST_SYNC_HI // 2)
 
 @dataclass(frozen=True)
 class SyncConfig:
-    """Configuration for direct sync or staging from a Beam node."""
+    """Configuration for staging from a Beam node."""
 
     endpoint: Address
     state_db_path: str
@@ -311,57 +309,6 @@ def _request_headers(
     return headers
 
 
-def _request_body(
-    connection: BeamConnection,
-    *,
-    endpoint: str,
-    header,
-    timeout: float,
-):
-    """Request one full block body by explicit header id."""
-    message_type, payload = _request_body_payload(
-        connection,
-        endpoint=endpoint,
-        header=header,
-        timeout=timeout,
-    )
-    return _decode_body_message(message_type, payload, header)
-
-
-def _request_body_payload(
-    connection: BeamConnection,
-    *,
-    endpoint: str,
-    header,
-    timeout: float,
-) -> tuple[MessageType, bytes]:
-    """Request one full block body by explicit header id and return the raw frame."""
-    payload = encode_get_body_pack_payload(
-        top_height=header.height,
-        top_hash=bytes.fromhex(header.hash),
-        flag_perishable=BODY_FLAG_FULL,
-        flag_eternal=BODY_FLAG_FULL,
-        count_extra=0,
-        block0=0,
-        horizon_lo1=0,
-        horizon_hi1=0,
-    )
-    connection.send(MessageType.GET_BODY_PACK, payload)
-    _log(connection.verbose, f"[*] {endpoint} requested body for height {header.height}")
-
-    message_type, payload = _recv_until(
-        connection,
-        endpoint=endpoint,
-        expected={MessageType.BODY, MessageType.BODY_PACK},
-        timeout=timeout,
-    )
-    if message_type == MessageType.BODY:
-        return message_type, payload
-    if message_type == MessageType.BODY_PACK:
-        return message_type, payload
-    raise RuntimeError(f"unexpected message while waiting for body: {message_name(message_type)}")
-
-
 def _request_treasury_payload(
     connection: BeamConnection,
     *,
@@ -506,23 +453,6 @@ def _body_payloads_from_message(
             encode_body_payload(perishable=perishable, eternal=eternal)
             for perishable, eternal in split_body_pack_payload(payload)
         ]
-    raise RuntimeError(f"unsupported block body message: {message_name(message_type)}")
-
-
-def _decode_body_messages(
-    message_type: MessageType,
-    payload: bytes,
-    headers: Sequence,
-) -> list:
-    """Decode one or more blocks from a raw body message."""
-    if message_type == MessageType.BODY:
-        if len(headers) != 1:
-            raise RuntimeError(
-                f"expected one header for Body, got {len(headers)}"
-            )
-        return [deserialize_body_payload(payload, headers[0])]
-    if message_type == MessageType.BODY_PACK:
-        return deserialize_body_pack_payloads(payload, headers)
     raise RuntimeError(f"unsupported block body message: {message_name(message_type)}")
 
 
@@ -758,7 +688,7 @@ def run_stage(config: SyncConfig) -> StageResult:
     )
 
 
-def run_derive(config: DeriveConfig, writer: JsonLineWriter) -> DeriveResult:
+def run_derive(config: DeriveConfig) -> DeriveResult:
     """Derive UTXOs from previously staged headers and block payloads."""
     started = time.monotonic()
     store = StateStore(config.state_db_path)
@@ -836,8 +766,6 @@ def run_derive(config: DeriveConfig, writer: JsonLineWriter) -> DeriveResult:
                 raise RuntimeError(
                     f"staged block set is incomplete between heights {start_height} and {target_height}"
                 )
-
-        exported_utxos = store.export_unspent(writer, target_height)
         synced_height = store.last_synced_height()
     finally:
         store.close()
@@ -850,141 +778,38 @@ def run_derive(config: DeriveConfig, writer: JsonLineWriter) -> DeriveResult:
         outputs_seen=outputs_seen,
         resolved_spends=resolved_spends,
         unresolved_spends=unresolved_spends,
-        exported_utxos=exported_utxos,
         duration_seconds=duration,
     )
 
 
-def run_sync(config: SyncConfig, writer: JsonLineWriter) -> SyncResult:
-    """Synchronize blocks from a trusted Beam node and export current UTXOs."""
-    if config.fast_sync:
-        stage_result = run_stage(config)
-        derive_result = run_derive(
-            DeriveConfig(
-                state_db_path=config.state_db_path,
-                start_height=config.start_height,
-                stop_height=config.stop_height,
-                progress_every=config.progress_every,
-            ),
-            writer,
-        )
-        return SyncResult(
-            node=stage_result.node,
-            target_height=derive_result.target_height,
-            synced_height=derive_result.synced_height,
-            applied_blocks=derive_result.applied_blocks,
-            outputs_seen=derive_result.outputs_seen,
-            resolved_spends=derive_result.resolved_spends,
-            unresolved_spends=derive_result.unresolved_spends,
-            exported_utxos=derive_result.exported_utxos,
-            duration_seconds=stage_result.duration_seconds + derive_result.duration_seconds,
-        )
-
-    endpoint = format_address(config.endpoint)
-    started = time.monotonic()
-    store = StateStore(config.state_db_path)
-    connection = _open_connection(config.endpoint, config)
+def run_staged(config: SyncConfig) -> tuple[StageResult, DeriveResult]:
+    """Run the staged Beam sync pipeline from a trusted node into local SQLite state."""
     requested_start = _requested_start_height(config.start_height)
+    store = StateStore(config.state_db_path)
 
     try:
-        connection.connect()
-        connection.handshake(0, config.fork_hashes)
-
-        tip_header = _wait_for_tip_header(connection, endpoint, config.request_timeout)
-        target_height = tip_header.height
-        if config.stop_height is not None:
-            target_height = min(target_height, config.stop_height)
-
         last_synced_height = store.last_synced_height()
-        if config.stop_height is not None and config.stop_height < last_synced_height:
-            raise RuntimeError(
-                f"state DB is already synced to {last_synced_height}, which is past requested stop height {config.stop_height}"
-            )
-
-        _raise_if_start_past_available_height(
-            requested_start=requested_start,
-            target_height=target_height,
-            completed_height=last_synced_height,
-            available_name="node tip",
-        )
-        _raise_if_non_contiguous_start(
-            requested_start=requested_start,
-            next_height=last_synced_height + 1,
-            mode_name="direct mode",
-            state_name="synced state",
-        )
-        start_height = last_synced_height + 1
-
-        _store_treasury_payload_if_needed(
-            connection,
-            endpoint=endpoint,
-            timeout=config.request_timeout,
-            store=store,
-        )
-        _import_treasury_outputs_if_needed(store)
-
-        applied_blocks = 0
-        outputs_seen = 0
-        resolved_spends = 0
-        unresolved_spends = 0
-
-        if start_height <= target_height:
-            next_header_height = start_height
-            while next_header_height <= target_height:
-                batch_stop = min(
-                    target_height,
-                    next_header_height + HEADER_REQUEST_BATCH_SIZE - 1,
-                )
-                headers = _request_headers(
-                    connection,
-                    endpoint=endpoint,
-                    start_height=next_header_height,
-                    stop_height=batch_stop,
-                    timeout=config.request_timeout,
-                )
-                for header in headers:
-                    block = _request_body(
-                        connection,
-                        endpoint=endpoint,
-                        header=header,
-                        timeout=config.request_timeout,
-                    )
-                    stats = store.apply_block(header, block)
-
-                    applied_blocks += 1
-                    outputs_seen += stats.inserted_outputs
-                    resolved_spends += stats.resolved_spends
-                    unresolved_spends += stats.unresolved_spends
-
-                    if (
-                        applied_blocks == 1
-                        or header.height == target_height
-                        or applied_blocks % config.progress_every == 0
-                    ):
-                        print(
-                            f"[*] {endpoint} synced height {header.height}/{target_height}; "
-                            f"outputs+={stats.inserted_outputs}, spends+={stats.resolved_spends}, "
-                            f"missing+={stats.unresolved_spends}",
-                            file=sys.stderr,
-                        )
-
-                next_header_height = headers[-1].height + 1
-
-        exported_utxos = store.export_unspent(writer, target_height)
-        synced_height = store.last_synced_height()
     finally:
-        connection.close()
         store.close()
 
-    duration = time.monotonic() - started
-    return SyncResult(
-        node=endpoint,
-        target_height=target_height,
-        synced_height=synced_height,
-        applied_blocks=applied_blocks,
-        outputs_seen=outputs_seen,
-        resolved_spends=resolved_spends,
-        unresolved_spends=unresolved_spends,
-        exported_utxos=exported_utxos,
-        duration_seconds=duration,
+    if config.stop_height is not None and config.stop_height < last_synced_height:
+        raise RuntimeError(
+            f"state DB is already derived through {last_synced_height}, which is past requested stop height {config.stop_height}"
+        )
+    _raise_if_non_contiguous_start(
+        requested_start=requested_start,
+        next_height=last_synced_height + 1,
+        mode_name="staged mode",
+        state_name="derived state",
     )
+
+    stage_result = run_stage(config)
+    derive_result = run_derive(
+        DeriveConfig(
+            state_db_path=config.state_db_path,
+            start_height=config.start_height,
+            stop_height=config.stop_height,
+            progress_every=config.progress_every,
+        )
+    )
+    return stage_result, derive_result
