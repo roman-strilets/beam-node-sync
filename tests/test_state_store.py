@@ -58,6 +58,32 @@ def _treasury_output(tag: str, *, incubation: int = 0) -> BlockOutput:
     )
 
 
+def _inspect_rows(
+    db_path: Path,
+    query: str,
+    params: tuple[object, ...] = (),
+) -> list[sqlite3.Row]:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+
+
+def _inspect_row(
+    db_path: Path,
+    query: str,
+    params: tuple[object, ...] = (),
+) -> sqlite3.Row | None:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(query, params).fetchone()
+    finally:
+        conn.close()
+
+
 def test_state_store_applies_spends_and_tracks_unspent_outputs(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite3"
 
@@ -91,14 +117,15 @@ def test_state_store_applies_spends_and_tracks_unspent_outputs(tmp_path: Path) -
         assert stats2.resolved_spends == 1
         assert stats2.unresolved_spends == 0
 
-        rows = store._conn.execute(
+        rows = _inspect_rows(
+            db_path,
             """
             SELECT commitment, create_height
             FROM outputs
             WHERE spent_height IS NULL
             ORDER BY output_id ASC
             """
-        ).fetchall()
+        )
 
         assert len(rows) == 1
         assert rows[0]["create_height"] == header2.height
@@ -123,9 +150,7 @@ def test_state_store_computes_coinbase_maturity_height(tmp_path: Path) -> None:
         )
         store.apply_block(header, block)
 
-        row = store._conn.execute(
-            "SELECT maturity_height, spent_height FROM outputs"
-        ).fetchone()
+        row = _inspect_row(db_path, "SELECT maturity_height, spent_height FROM outputs")
         assert row is not None
         assert row["maturity_height"] == header.height + COINBASE_MATURITY + 2
         assert row["spent_height"] is None
@@ -197,7 +222,8 @@ def test_state_store_supports_duplicate_commitments_with_lifo_spends(
         assert stats3.resolved_spends == 1
         assert stats3.unresolved_spends == 0
 
-        rows = store._conn.execute(
+        rows = _inspect_rows(
+            db_path,
             """
             SELECT commitment, create_height, spent_height
             FROM outputs
@@ -205,7 +231,7 @@ def test_state_store_supports_duplicate_commitments_with_lifo_spends(
             ORDER BY output_id ASC
             """,
             (format_commitment(duplicate),),
-        ).fetchall()
+        )
 
         assert len(rows) == 2
         assert rows[0]["create_height"] == 1
@@ -216,85 +242,19 @@ def test_state_store_supports_duplicate_commitments_with_lifo_spends(
         store.close()
 
 
-def test_state_store_migrates_legacy_outputs_schema(tmp_path: Path) -> None:
+def test_state_store_initializes_outputs_schema(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite3"
-
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.executescript(
-            """
-            CREATE TABLE outputs (
-                commitment TEXT PRIMARY KEY,
-                commitment_x TEXT NOT NULL,
-                commitment_y INTEGER NOT NULL,
-                create_height INTEGER NOT NULL,
-                create_block_hash TEXT NOT NULL,
-                spent_height INTEGER,
-                coinbase INTEGER NOT NULL,
-                recovery_only INTEGER NOT NULL,
-                incubation INTEGER NOT NULL,
-                maturity_height INTEGER NOT NULL,
-                has_confidential_proof INTEGER NOT NULL,
-                has_public_proof INTEGER NOT NULL,
-                has_asset_proof INTEGER NOT NULL,
-                extra_flags INTEGER
-            );
-
-            INSERT INTO outputs (
-                commitment,
-                commitment_x,
-                commitment_y,
-                create_height,
-                create_block_hash,
-                spent_height,
-                coinbase,
-                recovery_only,
-                incubation,
-                maturity_height,
-                has_confidential_proof,
-                has_public_proof,
-                has_asset_proof,
-                extra_flags
-            ) VALUES (
-                'legacy:0',
-                'legacy',
-                0,
-                7,
-                'ab' || substr('0000000000000000000000000000000000000000000000000000000000000000', 3),
-                NULL,
-                0,
-                0,
-                0,
-                7,
-                0,
-                0,
-                0,
-                NULL
-            );
-            """
-        )
-    finally:
-        conn.close()
 
     store = StateStore(str(db_path))
     try:
-        migrated = sqlite3.connect(db_path)
-        migrated.row_factory = sqlite3.Row
-        try:
-            columns = {
-                row["name"]: row for row in migrated.execute("PRAGMA table_info(outputs)")
-            }
-            assert "output_id" in columns
+        columns = {row["name"]: row for row in _inspect_rows(db_path, "PRAGMA table_info(outputs)")}
+        assert "output_id" in columns
+        assert "commitment" in columns
+        assert "spent_height" in columns
 
-            row = migrated.execute(
-                "SELECT commitment, commitment_x, create_height FROM outputs"
-            ).fetchone()
-            assert row is not None
-            assert row["commitment"] == "legacy:0"
-            assert row["commitment_x"] == "legacy"
-            assert row["create_height"] == 7
-        finally:
-            migrated.close()
+        indexes = {row["name"] for row in _inspect_rows(db_path, "PRAGMA index_list(outputs)")}
+        assert "idx_outputs_unspent" in indexes
+        assert "idx_outputs_commitment_unspent" in indexes
     finally:
         store.close()
 
@@ -370,7 +330,7 @@ def test_run_derive_replays_staged_body_payloads(tmp_path: Path) -> None:
     store = StateStore(str(db_path))
     try:
         assert store.last_synced_height() == 2
-        row = store._conn.execute("SELECT COUNT(*) AS n FROM outputs").fetchone()
+        row = _inspect_row(db_path, "SELECT COUNT(*) AS n FROM outputs")
         assert row is not None
         assert row["n"] == 0
     finally:
@@ -394,9 +354,7 @@ def test_state_store_apply_block_marks_staged_header_as_applied(tmp_path: Path) 
         store.stage_header(header, source_node="node-a")
         store.apply_block(header, block)
 
-        row = store._conn.execute(
-            "SELECT source_node, applied FROM headers WHERE height = 1"
-        ).fetchone()
+        row = _inspect_row(db_path, "SELECT source_node, applied FROM headers WHERE height = 1")
         assert row is not None
         assert row["source_node"] == "node-a"
         assert row["applied"] == 1
@@ -439,17 +397,16 @@ def test_state_store_imports_treasury_outputs_and_reconciles_missing_inputs(
         assert store.treasury_payload_hash() == "payload-hash"
         assert store.treasury_imported_payload_hash() == "payload-hash"
 
-        row = store._conn.execute(
-            "SELECT create_height, spent_height, maturity_height FROM outputs"
-        ).fetchone()
+        row = _inspect_row(
+            db_path,
+            "SELECT create_height, spent_height, maturity_height FROM outputs",
+        )
         assert row is not None
         assert row["create_height"] == 0
         assert row["spent_height"] == 1
         assert row["maturity_height"] == 0
 
-        missing = store._conn.execute(
-            "SELECT COUNT(*) AS n FROM missing_inputs"
-        ).fetchone()
+        missing = _inspect_row(db_path, "SELECT COUNT(*) AS n FROM missing_inputs")
         assert missing is not None
         assert missing["n"] == 0
 
@@ -553,206 +510,23 @@ def test_state_store_supports_sparse_staged_header_ranges(tmp_path: Path) -> Non
         store.close()
 
 
-def test_state_store_migrates_legacy_staged_headers_into_headers(tmp_path: Path) -> None:
+def test_state_store_bootstraps_headers_and_staged_blocks_schema(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite3"
-    body_payload = _empty_body_payload()
-    header1 = _header(1, "00" * 32)
-    header2 = _header(2, header1.hash)
-
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.executescript(
-            """
-            CREATE TABLE headers (
-                height INTEGER PRIMARY KEY,
-                hash TEXT NOT NULL,
-                previous_hash TEXT NOT NULL,
-                chainwork TEXT NOT NULL,
-                kernels TEXT NOT NULL,
-                definition TEXT NOT NULL,
-                timestamp INTEGER NOT NULL,
-                packed_difficulty INTEGER NOT NULL,
-                difficulty REAL NOT NULL,
-                rules_hash TEXT,
-                pow_indices_hex TEXT NOT NULL,
-                pow_nonce_hex TEXT NOT NULL
-            );
-
-            CREATE TABLE staged_headers (
-                height INTEGER PRIMARY KEY,
-                hash TEXT NOT NULL,
-                previous_hash TEXT NOT NULL,
-                chainwork TEXT NOT NULL,
-                kernels TEXT NOT NULL,
-                definition TEXT NOT NULL,
-                timestamp INTEGER NOT NULL,
-                packed_difficulty INTEGER NOT NULL,
-                difficulty REAL NOT NULL,
-                rules_hash TEXT,
-                pow_indices_hex TEXT NOT NULL,
-                pow_nonce_hex TEXT NOT NULL,
-                source_node TEXT NOT NULL
-            );
-
-            CREATE TABLE staged_blocks (
-                height INTEGER PRIMARY KEY,
-                block_hash TEXT NOT NULL,
-                message_type INTEGER NOT NULL,
-                payload BLOB NOT NULL,
-                source_node TEXT NOT NULL,
-                FOREIGN KEY(height) REFERENCES staged_headers(height)
-            );
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO headers (
-                height,
-                hash,
-                previous_hash,
-                chainwork,
-                kernels,
-                definition,
-                timestamp,
-                packed_difficulty,
-                difficulty,
-                rules_hash,
-                pow_indices_hex,
-                pow_nonce_hex
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                header1.height,
-                header1.hash,
-                header1.previous_hash,
-                header1.chainwork,
-                header1.kernels,
-                header1.definition,
-                header1.timestamp,
-                header1.packed_difficulty,
-                header1.difficulty,
-                header1.rules_hash,
-                header1.pow_indices_hex,
-                header1.pow_nonce_hex,
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO staged_headers (
-                height,
-                hash,
-                previous_hash,
-                chainwork,
-                kernels,
-                definition,
-                timestamp,
-                packed_difficulty,
-                difficulty,
-                rules_hash,
-                pow_indices_hex,
-                pow_nonce_hex,
-                source_node
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                header1.height,
-                header1.hash,
-                header1.previous_hash,
-                header1.chainwork,
-                header1.kernels,
-                header1.definition,
-                header1.timestamp,
-                header1.packed_difficulty,
-                header1.difficulty,
-                header1.rules_hash,
-                header1.pow_indices_hex,
-                header1.pow_nonce_hex,
-                "node-a",
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO staged_headers (
-                height,
-                hash,
-                previous_hash,
-                chainwork,
-                kernels,
-                definition,
-                timestamp,
-                packed_difficulty,
-                difficulty,
-                rules_hash,
-                pow_indices_hex,
-                pow_nonce_hex,
-                source_node
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                header2.height,
-                header2.hash,
-                header2.previous_hash,
-                header2.chainwork,
-                header2.kernels,
-                header2.definition,
-                header2.timestamp,
-                header2.packed_difficulty,
-                header2.difficulty,
-                header2.rules_hash,
-                header2.pow_indices_hex,
-                header2.pow_nonce_hex,
-                "node-b",
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO staged_blocks (
-                height,
-                block_hash,
-                message_type,
-                payload,
-                source_node
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                header2.height,
-                header2.hash,
-                int(MessageType.BODY),
-                sqlite3.Binary(body_payload),
-                "node-b",
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
 
     store = StateStore(str(db_path))
     try:
-        assert not store._table_exists("staged_headers")
+        tables = {row["name"] for row in _inspect_rows(db_path, "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert {"headers", "staged_blocks", "outputs", "missing_inputs", "state_metadata", "treasury_payload"} <= tables
 
-        rows = store._conn.execute(
-            "SELECT height, source_node, applied FROM headers ORDER BY height ASC"
-        ).fetchall()
-        assert len(rows) == 2
-        assert rows[0]["height"] == 1
-        assert rows[0]["source_node"] == "node-a"
-        assert rows[0]["applied"] == 1
-        assert rows[1]["height"] == 2
-        assert rows[1]["source_node"] == "node-b"
-        assert rows[1]["applied"] == 0
+        header_columns = {row["name"] for row in _inspect_rows(db_path, "PRAGMA table_info(headers)")}
+        assert "source_node" in header_columns
+        assert "applied" in header_columns
 
-        assert store.last_synced_height() == 1
-        assert store.last_staged_header_height() == 2
-        assert store.last_staged_height() == 2
-
-        foreign_keys = list(store._conn.execute("PRAGMA foreign_key_list(staged_blocks)"))
+        foreign_keys = _inspect_rows(db_path, "PRAGMA foreign_key_list(staged_blocks)")
         assert len(foreign_keys) == 1
         assert foreign_keys[0]["table"] == "headers"
+
+        staged_indexes = {row["name"] for row in _inspect_rows(db_path, "PRAGMA index_list(staged_blocks)")}
+        assert "idx_staged_blocks_hash" in staged_indexes
     finally:
         store.close()
-
-    result = run_derive(DeriveConfig(state_db_path=str(db_path), progress_every=10))
-
-    assert result.target_height == 2
-    assert result.synced_height == 2
-    assert result.applied_blocks == 1

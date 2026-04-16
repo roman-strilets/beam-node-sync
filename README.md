@@ -11,6 +11,7 @@ Current scope:
 	staging phase using Beam's `GetBodyPack` horizons, then replays them locally.
 - Regular outputs only.
 - State is persisted in SQLite so reruns resume from the last staged and applied blocks.
+- The SQLite schema is created directly from SQLAlchemy metadata on first open; older DB layouts are not upgraded in place.
 
 Current limitations:
 - Trusted node model: no PoW, proof, or chainwork validation beyond simple linear checks.

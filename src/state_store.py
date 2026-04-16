@@ -1,12 +1,26 @@
-"""SQLite-backed persistent state for the Beam sync prototype."""
+"""SQLAlchemy-backed persistent state for the Beam sync prototype."""
 
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
-import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from sqlalchemy import and_, create_engine, delete, func, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import Engine, URL
+from sqlalchemy.orm import Session, sessionmaker
+
+from .db_models import (
+    Base,
+    HeaderEntity,
+    MissingInputEntity,
+    OutputEntity,
+    StagedBlockEntity,
+    StateMetadataEntity,
+    TreasuryPayloadEntity,
+)
 from .models import StagedBlockRecord
 from .protocol import MessageType
 from .protocol_models import BlockHeader, BlockOutput, DecodedBlock
@@ -36,482 +50,180 @@ class TreasuryImportStats:
 
 
 class StateStore:
-    """Persist synced headers and output state in SQLite."""
+    """Persist synced headers and output state in SQLite via SQLAlchemy ORM."""
 
     def __init__(self, path: str):
         self.path = path
         db_path = Path(path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(path)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._init_schema()
+        self._engine: Engine = self._create_engine(db_path)
+        Base.metadata.create_all(self._engine)
+        self._session_factory = sessionmaker(self._engine, expire_on_commit=False)
 
     def close(self) -> None:
-        self._conn.close()
+        self._engine.dispose()
 
-    def _init_schema(self) -> None:
-        with self._conn:
-            self._conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS missing_inputs (
-                    block_height INTEGER NOT NULL,
-                    commitment TEXT NOT NULL,
-                    PRIMARY KEY(block_height, commitment)
-                );
-                """
-            )
+    @staticmethod
+    def _create_engine(db_path: Path) -> Engine:
+        return create_engine(URL.create("sqlite+pysqlite", database=str(db_path)))
 
-            self._init_headers_schema()
-            self._init_treasury_schema()
-            self._init_outputs_schema()
-            self._init_staged_schema()
+    @contextmanager
+    def _read_session(self) -> Iterator[Session]:
+        session = self._session_factory()
+        try:
+            yield session
+        finally:
+            session.close()
 
-    def _init_headers_schema(self) -> None:
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS headers (
-                height INTEGER PRIMARY KEY,
-                hash TEXT NOT NULL,
-                previous_hash TEXT NOT NULL,
-                chainwork TEXT NOT NULL,
-                kernels TEXT NOT NULL,
-                definition TEXT NOT NULL,
-                timestamp INTEGER NOT NULL,
-                packed_difficulty INTEGER NOT NULL,
-                difficulty REAL NOT NULL,
-                rules_hash TEXT,
-                pow_indices_hex TEXT NOT NULL,
-                pow_nonce_hex TEXT NOT NULL,
-                source_node TEXT,
-                applied INTEGER NOT NULL DEFAULT 1
-            )
-            """
-        )
+    @contextmanager
+    def _write_session(self) -> Iterator[Session]:
+        session = self._session_factory()
+        try:
+            with session.begin():
+                yield session
+        finally:
+            session.close()
 
-        columns = {
-            str(row["name"]): row for row in self._conn.execute("PRAGMA table_info(headers)")
-        }
-        if "source_node" not in columns:
-            self._conn.execute("ALTER TABLE headers ADD COLUMN source_node TEXT")
-        if "applied" not in columns:
-            self._conn.execute(
-                "ALTER TABLE headers ADD COLUMN applied INTEGER NOT NULL DEFAULT 1"
-            )
-        self._conn.execute("UPDATE headers SET applied = 1 WHERE applied IS NULL")
-        self._conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_headers_applied_height
-                ON headers(applied, height)
-            """
-        )
-
-    def _init_staged_schema(self) -> None:
-        self._ensure_staged_blocks_schema()
-        self._migrate_legacy_staged_headers()
-
-    def _ensure_staged_blocks_schema(self) -> None:
-        columns = {
-            str(row["name"]): row
-            for row in self._conn.execute("PRAGMA table_info(staged_blocks)")
-        }
-        if not columns:
-            self._create_staged_blocks_table()
-            self._create_staged_blocks_indexes()
-            return
-
-        foreign_keys = list(self._conn.execute("PRAGMA foreign_key_list(staged_blocks)"))
-        if any(str(row["table"]) == "headers" for row in foreign_keys):
-            self._create_staged_blocks_indexes()
-            return
-
-        self._migrate_staged_blocks_table()
-        self._create_staged_blocks_indexes()
-
-    def _create_staged_blocks_table(self, table_name: str = "staged_blocks") -> None:
-        self._conn.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {table_name} (
-                height INTEGER PRIMARY KEY,
-                block_hash TEXT NOT NULL,
-                message_type INTEGER NOT NULL,
-                payload BLOB NOT NULL,
-                source_node TEXT NOT NULL,
-                FOREIGN KEY(height) REFERENCES headers(height)
-            )
-            """
-        )
-
-    def _create_staged_blocks_indexes(self) -> None:
-        self._conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_staged_blocks_hash
-                ON staged_blocks(block_hash)
-            """
-        )
-
-    def _migrate_staged_blocks_table(self) -> None:
-        self._conn.execute("DROP TABLE IF EXISTS staged_blocks_new")
-        self._create_staged_blocks_table("staged_blocks_new")
-        self._conn.execute(
-            """
-            INSERT INTO staged_blocks_new (
-                height,
-                block_hash,
-                message_type,
-                payload,
-                source_node
-            )
-            SELECT
-                height,
-                block_hash,
-                message_type,
-                payload,
-                source_node
-            FROM staged_blocks
-            ORDER BY height ASC
-            """
-        )
-        self._conn.execute("DROP TABLE staged_blocks")
-        self._conn.execute("ALTER TABLE staged_blocks_new RENAME TO staged_blocks")
-
-    def _migrate_legacy_staged_headers(self) -> None:
-        if not self._table_exists("staged_headers"):
-            return
-
-        rows = self._conn.execute(
-            """
-            SELECT
-                height,
-                hash,
-                previous_hash,
-                chainwork,
-                kernels,
-                definition,
-                timestamp,
-                packed_difficulty,
-                difficulty,
-                rules_hash,
-                pow_indices_hex,
-                pow_nonce_hex,
-                source_node
-            FROM staged_headers
-            ORDER BY height ASC
-            """
-        ).fetchall()
-
-        for row in rows:
-            existing = self._header_row(int(row["height"]))
-            if existing is None:
-                self._conn.execute(
-                    """
-                    INSERT INTO headers (
-                        height,
-                        hash,
-                        previous_hash,
-                        chainwork,
-                        kernels,
-                        definition,
-                        timestamp,
-                        packed_difficulty,
-                        difficulty,
-                        rules_hash,
-                        pow_indices_hex,
-                        pow_nonce_hex,
-                        source_node,
-                        applied
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-                    """,
-                    (
-                        int(row["height"]),
-                        str(row["hash"]),
-                        str(row["previous_hash"]),
-                        str(row["chainwork"]),
-                        str(row["kernels"]),
-                        str(row["definition"]),
-                        int(row["timestamp"]),
-                        int(row["packed_difficulty"]),
-                        float(row["difficulty"]),
-                        None if row["rules_hash"] is None else str(row["rules_hash"]),
-                        str(row["pow_indices_hex"]),
-                        str(row["pow_nonce_hex"]),
-                        str(row["source_node"]),
-                    ),
-                )
-                continue
-
-            self._assert_header_matches(
-                existing,
-                self._row_to_header(row),
-                context="legacy staged header",
-            )
-            if existing["source_node"] is None:
-                self._conn.execute(
-                    "UPDATE headers SET source_node = ? WHERE height = ?",
-                    (str(row["source_node"]), int(row["height"])),
-                )
-
-        self._conn.execute("DROP TABLE staged_headers")
-
-    def _table_exists(self, table_name: str) -> bool:
-        row = self._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-            (table_name,),
-        ).fetchone()
-        return row is not None
-
-    def _init_treasury_schema(self) -> None:
-        self._conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS state_metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS treasury_payload (
-                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                payload_sha256 TEXT NOT NULL,
-                payload BLOB NOT NULL,
-                source_node TEXT NOT NULL
-            );
-            """
-        )
-
-    def _init_outputs_schema(self) -> None:
-        columns = {
-            str(row["name"]): row for row in self._conn.execute("PRAGMA table_info(outputs)")
-        }
-        if not columns:
-            self._create_outputs_table()
-            self._create_outputs_indexes()
-            return
-
-        if "output_id" not in columns:
-            self._migrate_legacy_outputs_table()
-
-        self._create_outputs_indexes()
-
-    def _create_outputs_table(self) -> None:
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS outputs (
-                output_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                commitment TEXT NOT NULL,
-                commitment_x TEXT NOT NULL,
-                commitment_y INTEGER NOT NULL,
-                create_height INTEGER NOT NULL,
-                create_block_hash TEXT NOT NULL,
-                spent_height INTEGER,
-                coinbase INTEGER NOT NULL,
-                recovery_only INTEGER NOT NULL,
-                incubation INTEGER NOT NULL,
-                maturity_height INTEGER NOT NULL,
-                has_confidential_proof INTEGER NOT NULL,
-                has_public_proof INTEGER NOT NULL,
-                has_asset_proof INTEGER NOT NULL,
-                extra_flags INTEGER
-            )
-            """
-        )
-
-    def _create_outputs_indexes(self) -> None:
-        self._conn.executescript(
-            """
-            CREATE INDEX IF NOT EXISTS idx_outputs_unspent
-                ON outputs(spent_height, create_height, output_id);
-
-            CREATE INDEX IF NOT EXISTS idx_outputs_commitment_unspent
-                ON outputs(commitment, spent_height, output_id DESC);
-            """
-        )
-
-    def _migrate_legacy_outputs_table(self) -> None:
-        self._conn.execute("DROP TABLE IF EXISTS outputs_new")
-        self._create_outputs_table_for_migration("outputs_new")
-        self._conn.execute(
-            """
-            INSERT INTO outputs_new (
-                commitment,
-                commitment_x,
-                commitment_y,
-                create_height,
-                create_block_hash,
-                spent_height,
-                coinbase,
-                recovery_only,
-                incubation,
-                maturity_height,
-                has_confidential_proof,
-                has_public_proof,
-                has_asset_proof,
-                extra_flags
-            )
-            SELECT
-                commitment,
-                commitment_x,
-                commitment_y,
-                create_height,
-                create_block_hash,
-                spent_height,
-                coinbase,
-                recovery_only,
-                incubation,
-                maturity_height,
-                has_confidential_proof,
-                has_public_proof,
-                has_asset_proof,
-                extra_flags
-            FROM outputs
-            ORDER BY rowid ASC
-            """
-        )
-        self._conn.execute("DROP TABLE outputs")
-        self._conn.execute("ALTER TABLE outputs_new RENAME TO outputs")
-
-    def _create_outputs_table_for_migration(self, table_name: str) -> None:
-        self._conn.execute(
-            f"""
-            CREATE TABLE {table_name} (
-                output_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                commitment TEXT NOT NULL,
-                commitment_x TEXT NOT NULL,
-                commitment_y INTEGER NOT NULL,
-                create_height INTEGER NOT NULL,
-                create_block_hash TEXT NOT NULL,
-                spent_height INTEGER,
-                coinbase INTEGER NOT NULL,
-                recovery_only INTEGER NOT NULL,
-                incubation INTEGER NOT NULL,
-                maturity_height INTEGER NOT NULL,
-                has_confidential_proof INTEGER NOT NULL,
-                has_public_proof INTEGER NOT NULL,
-                has_asset_proof INTEGER NOT NULL,
-                extra_flags INTEGER
-            )
-            """
-        )
-
-    def _header_row(self, height: int) -> sqlite3.Row | None:
-        return self._conn.execute(
-            """
-            SELECT
-                height,
-                hash,
-                previous_hash,
-                chainwork,
-                kernels,
-                definition,
-                timestamp,
-                packed_difficulty,
-                difficulty,
-                rules_hash,
-                pow_indices_hex,
-                pow_nonce_hex,
-                source_node,
-                applied
-            FROM headers
-            WHERE height = ?
-            """,
-            (height,),
-        ).fetchone()
+    @staticmethod
+    def _header_entity(session: Session, height: int) -> HeaderEntity | None:
+        return session.get(HeaderEntity, height)
 
     def _assert_header_matches(
         self,
-        row: sqlite3.Row,
+        entity: HeaderEntity,
         header: BlockHeader,
         *,
         context: str,
     ) -> None:
-        if self._row_to_header(row) != header:
+        if self._entity_to_header(entity) != header:
             raise RuntimeError(f"{context} mismatch at height {header.height}")
 
+    @staticmethod
+    def _entity_to_header(entity: HeaderEntity) -> BlockHeader:
+        return BlockHeader(
+            height=entity.height,
+            hash=entity.hash,
+            previous_hash=entity.previous_hash,
+            chainwork=entity.chainwork,
+            kernels=entity.kernels,
+            definition=entity.definition,
+            timestamp=entity.timestamp,
+            packed_difficulty=entity.packed_difficulty,
+            difficulty=entity.difficulty,
+            rules_hash=entity.rules_hash,
+            pow_indices_hex=entity.pow_indices_hex,
+            pow_nonce_hex=entity.pow_nonce_hex,
+        )
+
+    @staticmethod
+    def _last_synced_height_in_session(session: Session) -> int:
+        value = session.scalar(
+            select(func.coalesce(func.max(HeaderEntity.height), 0)).where(
+                HeaderEntity.applied.is_(True)
+            )
+        )
+        return int(value or 0)
+
+    @staticmethod
+    def _last_header_hash_in_session(session: Session) -> str | None:
+        return session.scalar(
+            select(HeaderEntity.hash)
+            .where(HeaderEntity.applied.is_(True))
+            .order_by(HeaderEntity.height.desc())
+            .limit(1)
+        )
+
+    @staticmethod
+    def _get_metadata_in_session(session: Session, key: str) -> str | None:
+        entity = session.get(StateMetadataEntity, key)
+        return None if entity is None else entity.value
+
+    @staticmethod
+    def _set_metadata_in_session(session: Session, key: str, value: str) -> None:
+        session.execute(
+            sqlite_insert(StateMetadataEntity)
+            .values(key=key, value=value)
+            .on_conflict_do_update(
+                index_elements=[StateMetadataEntity.key],
+                set_={"value": value},
+            )
+        )
+
     def last_synced_height(self) -> int:
-        row = self._conn.execute(
-            "SELECT COALESCE(MAX(height), 0) AS height FROM headers WHERE applied = 1"
-        ).fetchone()
-        return int(row["height"])
+        with self._read_session() as session:
+            return self._last_synced_height_in_session(session)
 
     def last_header_hash(self) -> str | None:
-        row = self._conn.execute(
-            "SELECT hash FROM headers WHERE applied = 1 ORDER BY height DESC LIMIT 1"
-        ).fetchone()
-        return None if row is None else str(row["hash"])
+        with self._read_session() as session:
+            return self._last_header_hash_in_session(session)
 
     def last_staged_header_height(self) -> int:
-        row = self._conn.execute(
-            "SELECT COALESCE(MAX(height), 0) AS height FROM headers"
-        ).fetchone()
-        return int(row["height"])
+        with self._read_session() as session:
+            value = session.scalar(select(func.coalesce(func.max(HeaderEntity.height), 0)))
+            return int(value or 0)
 
     def last_staged_header_hash(self) -> str | None:
-        row = self._conn.execute(
-            "SELECT hash FROM headers ORDER BY height DESC LIMIT 1"
-        ).fetchone()
-        return None if row is None else str(row["hash"])
+        with self._read_session() as session:
+            return session.scalar(
+                select(HeaderEntity.hash)
+                .order_by(HeaderEntity.height.desc())
+                .limit(1)
+            )
 
     def last_staged_height(self) -> int:
         height = 0
         expected = 1
-        rows = self._conn.execute(
-            """
-            SELECT
-                h.height,
-                h.applied,
-                CASE WHEN sb.height IS NULL THEN 0 ELSE 1 END AS has_block
-            FROM headers AS h
-            LEFT JOIN staged_blocks AS sb
-                ON sb.height = h.height AND sb.block_hash = h.hash
-            ORDER BY h.height ASC
-            """
-        )
-        for row in rows:
-            current = int(row["height"])
-            if current != expected:
-                break
-            if not int(row["applied"]) and not int(row["has_block"]):
-                break
-            height = current
-            expected += 1
+        with self._read_session() as session:
+            rows = session.execute(
+                select(
+                    HeaderEntity.height,
+                    HeaderEntity.applied,
+                    StagedBlockEntity.height,
+                )
+                .outerjoin(
+                    StagedBlockEntity,
+                    and_(
+                        StagedBlockEntity.height == HeaderEntity.height,
+                        StagedBlockEntity.block_hash == HeaderEntity.hash,
+                    ),
+                )
+                .order_by(HeaderEntity.height.asc())
+            )
+            for current, applied, staged_height in rows:
+                current_height = int(current)
+                if current_height != expected:
+                    break
+                if not bool(applied) and staged_height is None:
+                    break
+                height = current_height
+                expected += 1
         return height
 
     def last_staged_hash(self) -> str | None:
         height = self.last_staged_height()
         if height <= 0:
             return None
-        row = self._conn.execute(
-            "SELECT hash FROM headers WHERE height = ?",
-            (height,),
-        ).fetchone()
-        return None if row is None else str(row["hash"])
+        with self._read_session() as session:
+            entity = self._header_entity(session, height)
+            return None if entity is None else entity.hash
 
     def _get_metadata(self, key: str) -> str | None:
-        row = self._conn.execute(
-            "SELECT value FROM state_metadata WHERE key = ?",
-            (key,),
-        ).fetchone()
-        return None if row is None else str(row["value"])
+        with self._read_session() as session:
+            return self._get_metadata_in_session(session, key)
 
     def _set_metadata(self, key: str, value: str) -> None:
-        self._conn.execute(
-            """
-            INSERT OR REPLACE INTO state_metadata(key, value)
-            VALUES (?, ?)
-            """,
-            (key, value),
-        )
+        with self._write_session() as session:
+            self._set_metadata_in_session(session, key, value)
 
     def treasury_payload_hash(self) -> str | None:
-        row = self._conn.execute(
-            "SELECT payload_sha256 FROM treasury_payload WHERE singleton = 1"
-        ).fetchone()
-        return None if row is None else str(row["payload_sha256"])
+        with self._read_session() as session:
+            entity = session.get(TreasuryPayloadEntity, 1)
+            return None if entity is None else entity.payload_sha256
 
     def treasury_payload(self) -> bytes | None:
-        row = self._conn.execute(
-            "SELECT payload FROM treasury_payload WHERE singleton = 1"
-        ).fetchone()
-        return None if row is None else bytes(row["payload"])
+        with self._read_session() as session:
+            entity = session.get(TreasuryPayloadEntity, 1)
+            return None if entity is None else bytes(entity.payload)
 
     def treasury_imported_payload_hash(self) -> str | None:
         return self._get_metadata(TREASURY_IMPORTED_PAYLOAD_SHA256_KEY)
@@ -523,44 +235,25 @@ class StateStore:
         payload_sha256: str,
         source_node: str,
     ) -> None:
-        row = self._conn.execute(
-            "SELECT payload_sha256 FROM treasury_payload WHERE singleton = 1"
-        ).fetchone()
-        if row is not None:
-            existing_hash = str(row["payload_sha256"])
-            if existing_hash != payload_sha256:
-                raise RuntimeError(
-                    "stored treasury payload hash mismatch: expected "
-                    f"{existing_hash}, got {payload_sha256}"
+        with self._write_session() as session:
+            entity = session.get(TreasuryPayloadEntity, 1)
+            if entity is not None:
+                existing_hash = entity.payload_sha256
+                if existing_hash != payload_sha256:
+                    raise RuntimeError(
+                        "stored treasury payload hash mismatch: expected "
+                        f"{existing_hash}, got {payload_sha256}"
+                    )
+                return
+
+            session.add(
+                TreasuryPayloadEntity(
+                    singleton=1,
+                    payload_sha256=payload_sha256,
+                    payload=payload,
+                    source_node=source_node,
                 )
-            return
-
-        with self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO treasury_payload (
-                    singleton, payload_sha256, payload, source_node
-                ) VALUES (1, ?, ?, ?)
-                """,
-                (payload_sha256, sqlite3.Binary(payload), source_node),
             )
-
-    @staticmethod
-    def _row_to_header(row: sqlite3.Row) -> BlockHeader:
-        return BlockHeader(
-            height=int(row["height"]),
-            hash=str(row["hash"]),
-            previous_hash=str(row["previous_hash"]),
-            chainwork=str(row["chainwork"]),
-            kernels=str(row["kernels"]),
-            definition=str(row["definition"]),
-            timestamp=int(row["timestamp"]),
-            packed_difficulty=int(row["packed_difficulty"]),
-            difficulty=float(row["difficulty"]),
-            rules_hash=None if row["rules_hash"] is None else str(row["rules_hash"]),
-            pow_indices_hex=str(row["pow_indices_hex"]),
-            pow_nonce_hex=str(row["pow_nonce_hex"]),
-        )
 
     def stage_header(
         self,
@@ -573,61 +266,45 @@ class StateStore:
         Staged headers may be inserted as sparse ranges for stage-only workflows.
         When adjacent headers already exist, their hashes must still line up.
         """
-        existing = self._header_row(header.height)
-        if existing is not None:
-            self._assert_header_matches(existing, header, context="stored header")
-            if existing["source_node"] is None:
-                with self._conn:
-                    self._conn.execute(
-                        "UPDATE headers SET source_node = ? WHERE height = ?",
-                        (source_node, header.height),
-                    )
-            return
+        with self._write_session() as session:
+            existing = self._header_entity(session, header.height)
+            if existing is not None:
+                self._assert_header_matches(existing, header, context="stored header")
+                if existing.source_node is None:
+                    existing.source_node = source_node
+                return
 
-        previous_row = self._conn.execute(
-            "SELECT hash FROM headers WHERE height = ?",
-            (header.height - 1,),
-        ).fetchone()
-        if previous_row is not None and header.previous_hash != str(previous_row["hash"]):
-            raise RuntimeError(
-                "staged header chain continuity check failed: previous hash does "
-                f"not match staged header height {header.height - 1}"
-            )
+            previous_entity = self._header_entity(session, header.height - 1)
+            if previous_entity is not None and header.previous_hash != previous_entity.hash:
+                raise RuntimeError(
+                    "staged header chain continuity check failed: previous hash does "
+                    f"not match staged header height {header.height - 1}"
+                )
 
-        next_row = self._conn.execute(
-            "SELECT previous_hash FROM headers WHERE height = ?",
-            (header.height + 1,),
-        ).fetchone()
-        if next_row is not None and str(next_row["previous_hash"]) != header.hash:
-            raise RuntimeError(
-                "staged header chain continuity check failed: stored header at "
-                f"height {header.height + 1} does not reference {header.hash}"
-            )
+            next_entity = self._header_entity(session, header.height + 1)
+            if next_entity is not None and next_entity.previous_hash != header.hash:
+                raise RuntimeError(
+                    "staged header chain continuity check failed: stored header at "
+                    f"height {header.height + 1} does not reference {header.hash}"
+                )
 
-        with self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO headers (
-                    height, hash, previous_hash, chainwork, kernels, definition,
-                    timestamp, packed_difficulty, difficulty, rules_hash,
-                    pow_indices_hex, pow_nonce_hex, source_node, applied
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-                """,
-                (
-                    header.height,
-                    header.hash,
-                    header.previous_hash,
-                    header.chainwork,
-                    header.kernels,
-                    header.definition,
-                    header.timestamp,
-                    header.packed_difficulty,
-                    header.difficulty,
-                    header.rules_hash,
-                    header.pow_indices_hex,
-                    header.pow_nonce_hex,
-                    source_node,
-                ),
+            session.add(
+                HeaderEntity(
+                    height=header.height,
+                    hash=header.hash,
+                    previous_hash=header.previous_hash,
+                    chainwork=header.chainwork,
+                    kernels=header.kernels,
+                    definition=header.definition,
+                    timestamp=header.timestamp,
+                    packed_difficulty=header.packed_difficulty,
+                    difficulty=header.difficulty,
+                    rules_hash=header.rules_hash,
+                    pow_indices_hex=header.pow_indices_hex,
+                    pow_nonce_hex=header.pow_nonce_hex,
+                    source_node=source_node,
+                    applied=False,
+                )
             )
 
     def iter_missing_staged_header_heights(
@@ -642,29 +319,24 @@ class StateStore:
         if stop_height is not None and stop_height < start_height:
             return
 
-        query = """
-            SELECT height
-            FROM headers
-            WHERE height >= ?
-        """
-        params: list[object] = [start_height]
-        if stop_height is not None:
-            query += " AND height <= ?"
-            params.append(stop_height)
-        query += " ORDER BY height ASC"
-
         expected = start_height
-        for row in self._conn.execute(query, params):
-            current = int(row["height"])
-            while expected < current:
-                yield expected
-                expected += 1
-            expected = current + 1
+        with self._read_session() as session:
+            stmt = select(HeaderEntity.height).where(HeaderEntity.height >= start_height)
+            if stop_height is not None:
+                stmt = stmt.where(HeaderEntity.height <= stop_height)
+            stmt = stmt.order_by(HeaderEntity.height.asc())
 
-        if stop_height is not None:
-            while expected <= stop_height:
-                yield expected
-                expected += 1
+            for current in session.scalars(stmt):
+                current_height = int(current)
+                while expected < current_height:
+                    yield expected
+                    expected += 1
+                expected = current_height + 1
+
+            if stop_height is not None:
+                while expected <= stop_height:
+                    yield expected
+                    expected += 1
 
     def stage_block_payload(
         self,
@@ -678,34 +350,36 @@ class StateStore:
         if message_type not in {MessageType.BODY, MessageType.BODY_PACK}:
             raise ValueError(f"unsupported staged message type: {message_type}")
 
-        row = self._conn.execute(
-            "SELECT hash FROM headers WHERE height = ?",
-            (header.height,),
-        ).fetchone()
-        if row is None:
-            raise RuntimeError(
-                f"cannot stage block payload for height {header.height} before its header is staged"
-            )
-        expected_hash = str(row["hash"])
-        if expected_hash != header.hash:
-            raise RuntimeError(
-                f"staged header hash mismatch at height {header.height}: expected {expected_hash}, got {header.hash}"
-            )
+        with self._write_session() as session:
+            header_entity = self._header_entity(session, header.height)
+            if header_entity is None:
+                raise RuntimeError(
+                    f"cannot stage block payload for height {header.height} before its header is staged"
+                )
+            expected_hash = header_entity.hash
+            if expected_hash != header.hash:
+                raise RuntimeError(
+                    f"staged header hash mismatch at height {header.height}: expected {expected_hash}, got {header.hash}"
+                )
 
-        with self._conn:
-            self._conn.execute(
-                """
-                INSERT OR REPLACE INTO staged_blocks (
-                    height, block_hash, message_type, payload, source_node
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    header.height,
-                    header.hash,
-                    int(message_type),
-                    sqlite3.Binary(payload),
-                    source_node,
-                ),
+            session.execute(
+                sqlite_insert(StagedBlockEntity)
+                .values(
+                    height=header.height,
+                    block_hash=header.hash,
+                    message_type=int(message_type),
+                    payload=payload,
+                    source_node=source_node,
+                )
+                .on_conflict_do_update(
+                    index_elements=[StagedBlockEntity.height],
+                    set_={
+                        "block_hash": header.hash,
+                        "message_type": int(message_type),
+                        "payload": payload,
+                        "source_node": source_node,
+                    },
+                )
             )
 
     def iter_staged_headers(
@@ -718,31 +392,14 @@ class StateStore:
         if start_height <= 0:
             raise ValueError(f"start_height must be > 0, got {start_height}")
 
-        query = """
-            SELECT
-                height,
-                hash,
-                previous_hash,
-                chainwork,
-                kernels,
-                definition,
-                timestamp,
-                packed_difficulty,
-                difficulty,
-                rules_hash,
-                pow_indices_hex,
-                pow_nonce_hex
-            FROM headers
-            WHERE height >= ?
-        """
-        params: list[object] = [start_height]
-        if stop_height is not None:
-            query += " AND height <= ?"
-            params.append(stop_height)
-        query += " ORDER BY height ASC"
+        with self._read_session() as session:
+            stmt = select(HeaderEntity).where(HeaderEntity.height >= start_height)
+            if stop_height is not None:
+                stmt = stmt.where(HeaderEntity.height <= stop_height)
+            stmt = stmt.order_by(HeaderEntity.height.asc())
 
-        for row in self._conn.execute(query, params):
-            yield self._row_to_header(row)
+            for entity in session.scalars(stmt):
+                yield self._entity_to_header(entity)
 
     def iter_missing_staged_headers(
         self,
@@ -754,33 +411,28 @@ class StateStore:
         if start_height <= 0:
             raise ValueError(f"start_height must be > 0, got {start_height}")
 
-        query = """
-            SELECT
-                h.height,
-                h.hash,
-                h.previous_hash,
-                h.chainwork,
-                h.kernels,
-                h.definition,
-                h.timestamp,
-                h.packed_difficulty,
-                h.difficulty,
-                h.rules_hash,
-                h.pow_indices_hex,
-                h.pow_nonce_hex
-            FROM headers AS h
-            LEFT JOIN staged_blocks AS sb
-                ON sb.height = h.height AND sb.block_hash = h.hash
-            WHERE h.height >= ? AND h.applied = 0 AND sb.height IS NULL
-        """
-        params: list[object] = [start_height]
-        if stop_height is not None:
-            query += " AND h.height <= ?"
-            params.append(stop_height)
-        query += " ORDER BY h.height ASC"
+        with self._read_session() as session:
+            stmt = (
+                select(HeaderEntity)
+                .outerjoin(
+                    StagedBlockEntity,
+                    and_(
+                        StagedBlockEntity.height == HeaderEntity.height,
+                        StagedBlockEntity.block_hash == HeaderEntity.hash,
+                    ),
+                )
+                .where(
+                    HeaderEntity.height >= start_height,
+                    HeaderEntity.applied.is_(False),
+                    StagedBlockEntity.height.is_(None),
+                )
+            )
+            if stop_height is not None:
+                stmt = stmt.where(HeaderEntity.height <= stop_height)
+            stmt = stmt.order_by(HeaderEntity.height.asc())
 
-        for row in self._conn.execute(query, params):
-            yield self._row_to_header(row)
+            for entity in session.scalars(stmt):
+                yield self._entity_to_header(entity)
 
     def iter_staged_blocks(
         self,
@@ -792,44 +444,41 @@ class StateStore:
         if start_height <= 0:
             raise ValueError(f"start_height must be > 0, got {start_height}")
 
-        query = """
-            SELECT
-                h.height,
-                h.hash,
-                h.previous_hash,
-                h.chainwork,
-                h.kernels,
-                h.definition,
-                h.timestamp,
-                h.packed_difficulty,
-                h.difficulty,
-                h.rules_hash,
-                h.pow_indices_hex,
-                h.pow_nonce_hex,
-                sb.message_type,
-                sb.payload,
-                sb.source_node AS block_source_node
-            FROM headers AS h
-            JOIN staged_blocks AS sb
-                ON sb.height = h.height AND sb.block_hash = h.hash
-            WHERE h.height >= ? AND h.applied = 0
-        """
-        params: list[object] = [start_height]
-        if stop_height is not None:
-            query += " AND h.height <= ?"
-            params.append(stop_height)
-        query += " ORDER BY h.height ASC"
-
-        for row in self._conn.execute(query, params):
-            yield StagedBlockRecord(
-                header=self._row_to_header(row),
-                body_message_type=MessageType(int(row["message_type"])),
-                body_payload=bytes(row["payload"]),
-                source_node=str(row["block_source_node"]),
+        with self._read_session() as session:
+            stmt = (
+                select(
+                    HeaderEntity,
+                    StagedBlockEntity.message_type,
+                    StagedBlockEntity.payload,
+                    StagedBlockEntity.source_node,
+                )
+                .join(
+                    StagedBlockEntity,
+                    and_(
+                        StagedBlockEntity.height == HeaderEntity.height,
+                        StagedBlockEntity.block_hash == HeaderEntity.hash,
+                    ),
+                )
+                .where(
+                    HeaderEntity.height >= start_height,
+                    HeaderEntity.applied.is_(False),
+                )
             )
+            if stop_height is not None:
+                stmt = stmt.where(HeaderEntity.height <= stop_height)
+            stmt = stmt.order_by(HeaderEntity.height.asc())
+
+            for header_entity, message_type, payload, source_node in session.execute(stmt):
+                yield StagedBlockRecord(
+                    header=self._entity_to_header(header_entity),
+                    body_message_type=MessageType(int(message_type)),
+                    body_payload=bytes(payload),
+                    source_node=str(source_node),
+                )
 
     def _insert_output_record(
         self,
+        session: Session,
         *,
         commitment: str,
         commitment_x: str,
@@ -845,33 +494,26 @@ class StateStore:
         has_public_proof: bool,
         has_asset_proof: bool,
         extra_flags: int | None,
-    ) -> sqlite3.Cursor:
-        return self._conn.execute(
-            """
-            INSERT INTO outputs (
-                commitment, commitment_x, commitment_y, create_height,
-                create_block_hash, spent_height, coinbase, recovery_only,
-                incubation, maturity_height, has_confidential_proof,
-                has_public_proof, has_asset_proof, extra_flags
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                commitment,
-                commitment_x,
-                1 if commitment_y else 0,
-                create_height,
-                create_block_hash,
-                spent_height,
-                1 if coinbase else 0,
-                1 if recovery_only else 0,
-                incubation,
-                maturity_height,
-                1 if has_confidential_proof else 0,
-                1 if has_public_proof else 0,
-                1 if has_asset_proof else 0,
-                extra_flags,
-            ),
+    ) -> OutputEntity:
+        entity = OutputEntity(
+            commitment=commitment,
+            commitment_x=commitment_x,
+            commitment_y=commitment_y,
+            create_height=create_height,
+            create_block_hash=create_block_hash,
+            spent_height=spent_height,
+            coinbase=coinbase,
+            recovery_only=recovery_only,
+            incubation=incubation,
+            maturity_height=maturity_height,
+            has_confidential_proof=has_confidential_proof,
+            has_public_proof=has_public_proof,
+            has_asset_proof=has_asset_proof,
+            extra_flags=extra_flags,
         )
+        session.add(entity)
+        session.flush()
+        return entity
 
     def import_treasury_outputs(
         self,
@@ -879,29 +521,34 @@ class StateStore:
         *,
         payload_sha256: str,
     ) -> TreasuryImportStats:
-        imported_hash = self.treasury_imported_payload_hash()
-        if imported_hash is not None:
-            if imported_hash != payload_sha256:
-                raise RuntimeError(
-                    "imported treasury payload hash mismatch: expected "
-                    f"{imported_hash}, got {payload_sha256}"
-                )
-            return TreasuryImportStats(inserted_outputs=0, reconciled_spends=0)
-
-        stored_hash = self.treasury_payload_hash()
-        if stored_hash is not None and stored_hash != payload_sha256:
-            raise RuntimeError(
-                f"stored treasury payload hash mismatch: expected {stored_hash}, got {payload_sha256}"
-            )
-
         inserted_outputs = 0
         reconciled_spends = 0
 
-        with self._conn:
+        with self._write_session() as session:
+            imported_hash = self._get_metadata_in_session(
+                session,
+                TREASURY_IMPORTED_PAYLOAD_SHA256_KEY,
+            )
+            if imported_hash is not None:
+                if imported_hash != payload_sha256:
+                    raise RuntimeError(
+                        "imported treasury payload hash mismatch: expected "
+                        f"{imported_hash}, got {payload_sha256}"
+                    )
+                return TreasuryImportStats(inserted_outputs=0, reconciled_spends=0)
+
+            stored_payload = session.get(TreasuryPayloadEntity, 1)
+            if stored_payload is not None and stored_payload.payload_sha256 != payload_sha256:
+                raise RuntimeError(
+                    "stored treasury payload hash mismatch: expected "
+                    f"{stored_payload.payload_sha256}, got {payload_sha256}"
+                )
+
             for output in outputs:
                 commitment = format_commitment(output.commitment)
                 incubation = int(output.incubation or 0)
-                cursor = self._insert_output_record(
+                inserted_output = self._insert_output_record(
+                    session,
                     commitment=commitment,
                     commitment_x=output.commitment.x,
                     commitment_y=output.commitment.y,
@@ -919,22 +566,25 @@ class StateStore:
                 )
                 inserted_outputs += 1
 
-                row = self._conn.execute(
-                    "SELECT MIN(block_height) AS block_height FROM missing_inputs WHERE commitment = ?",
-                    (commitment,),
-                ).fetchone()
-                if row is not None and row["block_height"] is not None:
-                    self._conn.execute(
-                        "UPDATE outputs SET spent_height = ? WHERE output_id = ?",
-                        (int(row["block_height"]), int(cursor.lastrowid)),
+                missing_height = session.scalar(
+                    select(func.min(MissingInputEntity.block_height)).where(
+                        MissingInputEntity.commitment == commitment
                     )
-                    self._conn.execute(
-                        "DELETE FROM missing_inputs WHERE commitment = ?",
-                        (commitment,),
+                )
+                if missing_height is not None:
+                    inserted_output.spent_height = int(missing_height)
+                    session.execute(
+                        delete(MissingInputEntity).where(
+                            MissingInputEntity.commitment == commitment
+                        )
                     )
                     reconciled_spends += 1
 
-            self._set_metadata(TREASURY_IMPORTED_PAYLOAD_SHA256_KEY, payload_sha256)
+            self._set_metadata_in_session(
+                session,
+                TREASURY_IMPORTED_PAYLOAD_SHA256_KEY,
+                payload_sha256,
+            )
 
         return TreasuryImportStats(
             inserted_outputs=inserted_outputs,
@@ -943,79 +593,73 @@ class StateStore:
 
     def apply_block(self, header: BlockHeader, block: DecodedBlock) -> ApplyStats:
         """Apply one decoded block to the local SQLite state."""
-        last_height = self.last_synced_height()
-        if header.height != last_height + 1:
-            raise RuntimeError(
-                f"expected next block height {last_height + 1}, got {header.height}"
-            )
-        if last_height > 0:
-            last_hash = self.last_header_hash()
-            if last_hash is not None and header.previous_hash != last_hash:
-                raise RuntimeError(
-                    "header chain continuity check failed: previous hash does not "
-                    f"match local height {last_height}"
-                )
-
         inserted_outputs = 0
         resolved_spends = 0
         unresolved_spends = 0
 
-        with self._conn:
-            existing = self._header_row(header.height)
+        with self._write_session() as session:
+            last_height = self._last_synced_height_in_session(session)
+            if header.height != last_height + 1:
+                raise RuntimeError(
+                    f"expected next block height {last_height + 1}, got {header.height}"
+                )
+            if last_height > 0:
+                last_hash = self._last_header_hash_in_session(session)
+                if last_hash is not None and header.previous_hash != last_hash:
+                    raise RuntimeError(
+                        "header chain continuity check failed: previous hash does not "
+                        f"match local height {last_height}"
+                    )
+
+            existing = self._header_entity(session, header.height)
             if existing is None:
-                self._conn.execute(
-                    """
-                    INSERT INTO headers (
-                        height, hash, previous_hash, chainwork, kernels, definition,
-                        timestamp, packed_difficulty, difficulty, rules_hash,
-                        pow_indices_hex, pow_nonce_hex, source_node, applied
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1)
-                    """,
-                    (
-                        header.height,
-                        header.hash,
-                        header.previous_hash,
-                        header.chainwork,
-                        header.kernels,
-                        header.definition,
-                        header.timestamp,
-                        header.packed_difficulty,
-                        header.difficulty,
-                        header.rules_hash,
-                        header.pow_indices_hex,
-                        header.pow_nonce_hex,
-                    ),
+                session.add(
+                    HeaderEntity(
+                        height=header.height,
+                        hash=header.hash,
+                        previous_hash=header.previous_hash,
+                        chainwork=header.chainwork,
+                        kernels=header.kernels,
+                        definition=header.definition,
+                        timestamp=header.timestamp,
+                        packed_difficulty=header.packed_difficulty,
+                        difficulty=header.difficulty,
+                        rules_hash=header.rules_hash,
+                        pow_indices_hex=header.pow_indices_hex,
+                        pow_nonce_hex=header.pow_nonce_hex,
+                        source_node=None,
+                        applied=True,
+                    )
                 )
             else:
                 self._assert_header_matches(existing, header, context="stored header")
-                self._conn.execute(
-                    "UPDATE headers SET applied = 1 WHERE height = ?",
-                    (header.height,),
-                )
+                existing.applied = True
 
             for tx_input in block.inputs:
                 commitment = format_commitment(tx_input.commitment)
-                row = self._conn.execute(
-                    """
-                    SELECT output_id
-                    FROM outputs
-                    WHERE commitment = ? AND spent_height IS NULL
-                    ORDER BY output_id DESC
-                    LIMIT 1
-                    """,
-                    (commitment,),
-                ).fetchone()
-                if row is not None:
-                    self._conn.execute(
-                        "UPDATE outputs SET spent_height = ? WHERE output_id = ?",
-                        (header.height, int(row["output_id"])),
+                output_entity = session.scalars(
+                    select(OutputEntity)
+                    .where(
+                        OutputEntity.commitment == commitment,
+                        OutputEntity.spent_height.is_(None),
                     )
+                    .order_by(OutputEntity.output_id.desc())
+                    .limit(1)
+                ).first()
+                if output_entity is not None:
+                    output_entity.spent_height = header.height
                     resolved_spends += 1
                 else:
                     unresolved_spends += 1
-                    self._conn.execute(
-                        "INSERT OR IGNORE INTO missing_inputs(block_height, commitment) VALUES (?, ?)",
-                        (header.height, commitment),
+                    session.execute(
+                        sqlite_insert(MissingInputEntity)
+                        .values(block_height=header.height, commitment=commitment)
+                        .on_conflict_do_nothing(
+                            index_elements=[
+                                MissingInputEntity.block_height,
+                                MissingInputEntity.commitment,
+                            ]
+                        )
                     )
 
             for output in block.outputs:
@@ -1025,6 +669,7 @@ class StateStore:
                     COINBASE_MATURITY if output.coinbase else 0
                 )
                 self._insert_output_record(
+                    session,
                     commitment=commitment,
                     commitment_x=output.commitment.x,
                     commitment_y=output.commitment.y,
