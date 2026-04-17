@@ -6,7 +6,8 @@ import argparse
 import sys
 
 from src.protocol import DEFAULT_CONNECT_TIMEOUT, DEFAULT_PORT, DEFAULT_REQUEST_TIMEOUT
-from src.syncer import SyncConfig, run_staged
+from src.sync_common import SyncConfig
+from src.sync_pipeline import run_staged
 from src.utils import parse_endpoint, parse_fork_hashes
 
 

@@ -2,10 +2,11 @@ from pathlib import Path
 import sqlite3
 
 from src.codec import encode_uint
+from src.derive_runner import run_derive
 from src.protocol import MessageType
 from src.protocol_models import BlockHeader, BlockOutput, DecodedBlock, EcPoint, TxCounts, TxInput
 from src.state_store import COINBASE_MATURITY, StateStore
-from src.syncer import DeriveConfig, run_derive
+from src.sync_common import DeriveConfig
 from src.utils import format_commitment
 
 

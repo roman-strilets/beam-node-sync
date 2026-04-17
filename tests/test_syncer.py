@@ -3,10 +3,13 @@ from pathlib import Path
 import pytest
 
 from src.codec import encode_body_payload, encode_uint
+from src.derive_runner import run_derive
 from src.protocol import MessageType
 from src.protocol_models import BlockHeader, DecodedBlock, EcPoint, TxCounts, TxInput
+from src.stage_runner import run_stage
 from src.state_store import StateStore
-from src.syncer import DeriveConfig, SyncConfig, run_derive, run_stage, run_staged
+from src.sync_common import DeriveConfig, SyncConfig
+from src.sync_pipeline import run_staged
 
 
 class _FakeConnection:
@@ -25,7 +28,7 @@ class _FakeConnection:
 @pytest.fixture(autouse=True)
 def _disable_treasury_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "src.syncer._request_treasury_payload",
+        "src.stage_runner._request_treasury_payload",
         lambda connection, *, endpoint, timeout: None,
     )
 
@@ -144,7 +147,7 @@ def test_run_staged_rejects_start_height_past_resume_floor(
             "run_staged should reject an impossible derive resume before staging"
         )
 
-    monkeypatch.setattr("src.syncer.run_stage", fail_run_stage)
+    monkeypatch.setattr("src.sync_pipeline.run_stage", fail_run_stage)
 
     with pytest.raises(RuntimeError, match="can only continue from height 2"):
         run_staged(
@@ -169,10 +172,10 @@ def test_run_stage_allows_fresh_sparse_range(
     requested_header_ranges: list[tuple[int, int]] = []
     requested_body_ranges: list[tuple[int, int, int, int, int, int]] = []
 
-    monkeypatch.setattr("src.syncer._open_connection", lambda endpoint, config: _FakeConnection())
-    monkeypatch.setattr("src.syncer._wait_for_tip_header", lambda connection, endpoint, timeout: headers[-1])
-    monkeypatch.setattr("src.syncer.HEADER_REQUEST_BATCH_SIZE", 8)
-    monkeypatch.setattr("src.syncer.BODY_REQUEST_BATCH_SIZE", 8)
+    monkeypatch.setattr("src.stage_runner._open_connection", lambda endpoint, config: _FakeConnection())
+    monkeypatch.setattr("src.stage_runner._wait_for_tip_header", lambda connection, endpoint, timeout: headers[-1])
+    monkeypatch.setattr("src.stage_runner.HEADER_REQUEST_BATCH_SIZE", 8)
+    monkeypatch.setattr("src.stage_runner.BODY_REQUEST_BATCH_SIZE", 8)
 
     header_by_height = {header.height: header for header in headers}
 
@@ -204,9 +207,9 @@ def test_run_stage_allows_fresh_sparse_range(
         )
         return MessageType.BODY_PACK, _empty_body_pack_payload(len(headers))
 
-    monkeypatch.setattr("src.syncer._request_headers", fake_request_headers)
+    monkeypatch.setattr("src.stage_runner._request_headers", fake_request_headers)
     monkeypatch.setattr(
-        "src.syncer._request_body_range_payload", fake_request_body_range_payload
+        "src.stage_runner._request_body_range_payload", fake_request_body_range_payload
     )
 
     result = run_stage(
@@ -260,9 +263,9 @@ def test_run_stage_fetches_missing_bodies_in_requested_range(
 
     requested_ranges: list[tuple[int, int]] = []
 
-    monkeypatch.setattr("src.syncer._open_connection", lambda endpoint, config: _FakeConnection())
-    monkeypatch.setattr("src.syncer._wait_for_tip_header", lambda connection, endpoint, timeout: headers[-1])
-    monkeypatch.setattr("src.syncer.BODY_REQUEST_BATCH_SIZE", 8)
+    monkeypatch.setattr("src.stage_runner._open_connection", lambda endpoint, config: _FakeConnection())
+    monkeypatch.setattr("src.stage_runner._wait_for_tip_header", lambda connection, endpoint, timeout: headers[-1])
+    monkeypatch.setattr("src.stage_runner.BODY_REQUEST_BATCH_SIZE", 8)
 
     def fail_request_headers(*_args, **_kwargs):
         raise AssertionError("run_stage should not request headers when they are already staged")
@@ -282,9 +285,9 @@ def test_run_stage_fetches_missing_bodies_in_requested_range(
         requested_ranges.append((headers[0].height, headers[-1].height))
         return MessageType.BODY_PACK, _empty_body_pack_payload(len(headers))
 
-    monkeypatch.setattr("src.syncer._request_headers", fail_request_headers)
+    monkeypatch.setattr("src.stage_runner._request_headers", fail_request_headers)
     monkeypatch.setattr(
-        "src.syncer._request_body_range_payload", fake_request_body_range_payload
+        "src.stage_runner._request_body_range_payload", fake_request_body_range_payload
     )
 
     result = run_stage(
@@ -311,12 +314,12 @@ def test_run_stage_fast_sync_uses_sparse_then_full_body_ranges(
     requested_header_ranges: list[tuple[int, int]] = []
     requested_ranges: list[tuple[int, int, int, int, int, int]] = []
 
-    monkeypatch.setattr("src.syncer._open_connection", lambda endpoint, config: _FakeConnection())
-    monkeypatch.setattr("src.syncer.HEADER_REQUEST_BATCH_SIZE", 8)
-    monkeypatch.setattr("src.syncer.BODY_REQUEST_BATCH_SIZE", 3)
-    monkeypatch.setattr("src.syncer.BEAM_FAST_SYNC_HI", 2)
-    monkeypatch.setattr("src.syncer.BEAM_FAST_SYNC_LO", 4)
-    monkeypatch.setattr("src.syncer.BEAM_FAST_SYNC_TRIGGER_GAP", 3)
+    monkeypatch.setattr("src.stage_runner._open_connection", lambda endpoint, config: _FakeConnection())
+    monkeypatch.setattr("src.stage_runner.HEADER_REQUEST_BATCH_SIZE", 8)
+    monkeypatch.setattr("src.stage_runner.BODY_REQUEST_BATCH_SIZE", 3)
+    monkeypatch.setattr("src.stage_runner.BEAM_FAST_SYNC_HI", 2)
+    monkeypatch.setattr("src.stage_runner.BEAM_FAST_SYNC_LO", 4)
+    monkeypatch.setattr("src.stage_runner.BEAM_FAST_SYNC_TRIGGER_GAP", 3)
 
     def fake_wait_for_tip_header(connection, endpoint, timeout):
         return _header(6, f"{5:064x}")
@@ -355,10 +358,10 @@ def test_run_stage_fast_sync_uses_sparse_then_full_body_ranges(
         )
         return payload_type, payload
 
-    monkeypatch.setattr("src.syncer._wait_for_tip_header", fake_wait_for_tip_header)
-    monkeypatch.setattr("src.syncer._request_headers", fake_request_headers)
+    monkeypatch.setattr("src.stage_runner._wait_for_tip_header", fake_wait_for_tip_header)
+    monkeypatch.setattr("src.stage_runner._request_headers", fake_request_headers)
     monkeypatch.setattr(
-        "src.syncer._request_body_range_payload", fake_request_body_range_payload
+        "src.stage_runner._request_body_range_payload", fake_request_body_range_payload
     )
 
     result = run_stage(
@@ -456,8 +459,8 @@ def test_run_staged_uses_stage_then_derive(
             "duration_seconds": 2.0,
         })()
 
-    monkeypatch.setattr("src.syncer.run_stage", fake_run_stage)
-    monkeypatch.setattr("src.syncer.run_derive", fake_run_derive)
+    monkeypatch.setattr("src.sync_pipeline.run_stage", fake_run_stage)
+    monkeypatch.setattr("src.sync_pipeline.run_derive", fake_run_derive)
 
     stage_result, derive_result = run_staged(
         SyncConfig(
@@ -490,18 +493,18 @@ def test_run_stage_and_derive_use_stored_treasury_payload(
     treasury_commitment = "aa".rjust(64, "0")
     header = _header(1, "00" * 32)
 
-    monkeypatch.setattr("src.syncer._open_connection", lambda endpoint, config: _FakeConnection())
-    monkeypatch.setattr("src.syncer._wait_for_tip_header", lambda connection, endpoint, timeout: header)
+    monkeypatch.setattr("src.stage_runner._open_connection", lambda endpoint, config: _FakeConnection())
+    monkeypatch.setattr("src.stage_runner._wait_for_tip_header", lambda connection, endpoint, timeout: header)
     monkeypatch.setattr(
-        "src.syncer._request_treasury_payload",
+        "src.stage_runner._request_treasury_payload",
         lambda connection, *, endpoint, timeout: _treasury_payload(treasury_commitment),
     )
     monkeypatch.setattr(
-        "src.syncer._request_headers",
+        "src.stage_runner._request_headers",
         lambda connection, *, endpoint, start_height, stop_height, timeout: [header],
     )
     monkeypatch.setattr(
-        "src.syncer._request_body_range_payload",
+        "src.stage_runner._request_body_range_payload",
         lambda connection, *, endpoint, headers, flag_perishable, flag_eternal, block0, horizon_lo1, horizon_hi1, timeout: (
             MessageType.BODY,
             _body_payload_with_input(treasury_commitment),
