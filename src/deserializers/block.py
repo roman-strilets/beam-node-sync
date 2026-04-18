@@ -327,8 +327,11 @@ def _block_output_from_tx_output(output: TxOutput) -> BlockOutput:
     )
 
 
-def _read_body_buffers(reader: BufferReader) -> tuple[bytes, bytes]:
-    return reader.read_byte_buffer(), reader.read_byte_buffer()
+def _read_body_buffers(reader: BufferReader) -> tuple[bytes, bytes, bytes]:
+    start = reader.offset
+    perishable = reader.read_byte_buffer()
+    eternal = reader.read_byte_buffer()
+    return perishable, eternal, reader.slice(start, reader.offset)
 
 
 def _deserialize_full_perishable(
@@ -417,6 +420,7 @@ def _deserialize_body_buffers(
     perishable: bytes,
     eternal: bytes,
     header: BlockHeader,
+    raw_payload: bytes | None = None,
 ) -> DecodedBlock:
     inputs, outputs, output_count, offset = _deserialize_perishable(perishable, header)
     kernel_count, kernels_mixed = _decode_kernel_count(eternal)
@@ -431,21 +435,22 @@ def _deserialize_body_buffers(
             kernels_mixed=kernels_mixed,
         ),
         offset=offset,
+        raw_payload=raw_payload,
     )
 
 
 def deserialize_body_payload(payload: bytes, header: BlockHeader) -> DecodedBlock:
     """Deserialize a single-block ``Body`` payload."""
     reader = BufferReader(payload)
-    perishable, eternal = _read_body_buffers(reader)
+    perishable, eternal, raw = _read_body_buffers(reader)
     if reader.remaining != 0:
         raise DeserializationError(
             f"{reader.remaining} trailing byte(s) left after Body parse"
         )
-    return _deserialize_body_buffers(perishable, eternal, header)
+    return _deserialize_body_buffers(perishable, eternal, header, raw_payload=raw)
 
 
-def split_body_pack_payload(payload: bytes) -> list[tuple[bytes, bytes]]:
+def split_body_pack_payload(payload: bytes) -> list[tuple[bytes, bytes, bytes]]:
     """Split a ``BodyPack`` payload into raw perishable/eternal body buffers."""
     reader = BufferReader(payload)
     body_count = reader.read_var_uint()
@@ -462,8 +467,8 @@ def split_body_pack_payload(payload: bytes) -> list[tuple[bytes, bytes]]:
 
 def deserialize_body_pack_payload(payload: bytes, header: BlockHeader) -> DecodedBlock:
     """Deserialize a ``BodyPack`` payload and return the first body."""
-    perishable, eternal = split_body_pack_payload(payload)[0]
-    return _deserialize_body_buffers(perishable, eternal, header)
+    perishable, eternal, raw = split_body_pack_payload(payload)[0]
+    return _deserialize_body_buffers(perishable, eternal, header, raw_payload=raw)
 
 
 def deserialize_body_pack_payloads(
@@ -478,6 +483,6 @@ def deserialize_body_pack_payloads(
         )
 
     return [
-        _deserialize_body_buffers(perishable, eternal, headers[index])
-        for index, (perishable, eternal) in enumerate(bodies)
+        _deserialize_body_buffers(perishable, eternal, headers[index], raw_payload=raw)
+        for index, (perishable, eternal, raw) in enumerate(bodies)
     ]

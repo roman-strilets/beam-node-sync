@@ -434,6 +434,65 @@ class StateStore:
             for entity in session.scalars(stmt):
                 yield self._entity_to_header(entity)
 
+    def iter_heights_needing_block_staging(
+        self,
+        *,
+        start_height: int = 1,
+        stop_height: int,
+    ) -> Iterator[int]:
+        """Yield heights in [start_height, stop_height] that need a full block fetch.
+
+        A height needs staging when it is either absent from ``headers``
+        entirely (no header stored yet) or present in ``headers`` with
+        ``applied=False`` but has no corresponding row in ``staged_blocks``.
+        Heights that are already applied or already have a staged body are
+        skipped.
+        """
+        if start_height <= 0:
+            raise ValueError(f"start_height must be > 0, got {start_height}")
+
+        expected = start_height
+        with self._read_session() as session:
+            # Fetch all header rows in range, left-joining the staged body.
+            # Rows where body_height IS NULL → body is missing.
+            stmt = (
+                select(
+                    HeaderEntity.height,
+                    HeaderEntity.applied,
+                    StagedBlockEntity.height.label("body_height"),
+                )
+                .outerjoin(
+                    StagedBlockEntity,
+                    and_(
+                        StagedBlockEntity.height == HeaderEntity.height,
+                        StagedBlockEntity.block_hash == HeaderEntity.hash,
+                    ),
+                )
+                .where(
+                    HeaderEntity.height >= start_height,
+                    HeaderEntity.height <= stop_height,
+                )
+                .order_by(HeaderEntity.height.asc())
+            )
+
+            for row in session.execute(stmt):
+                header_height = int(row.height)
+                # Yield any gap heights (no header row at all)
+                while expected < header_height:
+                    yield expected
+                    expected += 1
+
+                # If the header exists, not applied, and has no staged body
+                if not row.applied and row.body_height is None:
+                    yield header_height
+
+                expected = header_height + 1
+
+            # Yield trailing heights that have no header row at all
+            while expected <= stop_height:
+                yield expected
+                expected += 1
+
     def iter_staged_blocks(
         self,
         *,

@@ -76,6 +76,9 @@ class BufferReader:
         size = self.read_var_uint()
         return self.read_bytes(size)
 
+    def slice(self, start: int, end: int) -> bytes:
+        return self._data[start:end]
+
 
 def decode_msb_bits(data: bytes, bit_count: int) -> list[bool]:
     """Decode bits from ``data`` using most-significant-bit ordering."""

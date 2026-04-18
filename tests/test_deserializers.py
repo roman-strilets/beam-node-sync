@@ -238,8 +238,8 @@ def test_split_body_pack_payload_returns_all_bodies() -> None:
     bodies = split_body_pack_payload(payload)
 
     assert len(bodies) == 2
-    assert bodies[0] == (perishable, eternal)
-    assert bodies[1] == (perishable, eternal)
+    assert bodies[0][:2] == (perishable, eternal)
+    assert bodies[1][:2] == (perishable, eternal)
 
 
 def test_deserialize_body_pack_payloads_decodes_each_body() -> None:

@@ -220,3 +220,4 @@ class DecodedBlock:
     outputs: list[BlockOutput]
     counts: TxCounts
     offset: str | None = None
+    raw_payload: bytes | None = None
