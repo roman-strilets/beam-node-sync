@@ -41,7 +41,6 @@ class StageRunner:
         self.connection = self._open_connection()
         self.fetcher = NodeBlockFetcher(
             self.connection,
-            endpoint=self.endpoint,
             request_timeout=config.request_timeout,
             verbose=config.verbose,
         )
@@ -56,7 +55,6 @@ class StageRunner:
         self.started = time.monotonic()
 
         try:
-            self._connect()
             self.target_height = self._resolve_target_height()
             self._store_treasury_payload_if_needed()
             self._validate_requested_start()
@@ -85,19 +83,18 @@ class StageRunner:
             print(message, file=sys.stderr)
 
     def _open_connection(self) -> BeamConnection:
-        """Create a Beam connection configured from the runner config."""
+        """Create a Beam connection and establish it with the remote peer."""
         host, port = self.config.endpoint
-        return BeamConnection(
+        connection = BeamConnection(
             host=host,
             port=port,
             connect_timeout=self.config.connect_timeout,
             read_timeout=max(self.config.request_timeout, 1.0),
             verbose=self.config.verbose,
         )
-
-    def _connect(self) -> None:
-        self.connection.connect()
-        self.connection.handshake(0, self.config.fork_hashes)
+        connection.connect()
+        connection.handshake(0, self.config.fork_hashes)
+        return connection
 
     def _resolve_target_height(self) -> int:
         tip_header = self._wait_for_tip_header()

@@ -16,6 +16,7 @@ from .deserializers import (
     deserialize_header_pack_payloads,
 )
 from .protocol import MessageType, message_name
+from .utils import format_address
 
 
 @dataclass(frozen=True)
@@ -43,12 +44,11 @@ class NodeBlockFetcher:
         self,
         connection: BeamConnection,
         *,
-        endpoint: str,
         request_timeout: float,
         verbose: bool,
     ) -> None:
         self.connection = connection
-        self.endpoint = endpoint
+        self.endpoint = format_address((connection.host, connection.port))
         self.request_timeout = request_timeout
         self.verbose = verbose
 
