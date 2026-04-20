@@ -1,4 +1,4 @@
-from src.codec import decode_uint, encode_body_payload, encode_get_body_pack_payload, encode_uint
+from beam_p2p import decode_uint, encode_body_payload, encode_get_body_pack_payload, encode_uint
 
 
 def test_compact_uint_round_trip() -> None:

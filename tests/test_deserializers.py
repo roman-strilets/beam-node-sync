@@ -1,13 +1,13 @@
-from src.codec import encode_uint
-from src.deserializers.block import _get_rules_hash
-from src.deserializers import (
+from beam_p2p import encode_uint
+from beam_p2p.deserializers import (
     deserialize_body_pack_payloads,
     deserialize_body_payload,
     deserialize_header_pack,
     deserialize_header_pack_payloads,
     split_body_pack_payload,
 )
-from src.protocol_models import BlockHeader
+from beam_p2p.deserializers.block import _get_rules_hash
+from beam_p2p.protocol_models import BlockHeader
 
 
 def _encode_header_element(

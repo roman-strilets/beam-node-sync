@@ -6,12 +6,11 @@ import sys
 import time
 from collections.abc import Iterator
 
-from .codec import encode_get_body_pack_payload
-from .connection import BeamConnection
-from .deserializers import deserialize_new_tip_payload
+from beam_p2p import BeamConnection, MessageType, encode_get_body_pack_payload, format_address, message_name
+from beam_p2p.deserializers import deserialize_new_tip_payload
+
 from .node_fetcher import BODY_FLAG_FULL, BODY_FLAG_NONE, BODY_FLAG_RECOVERY1, BodyFetchPlan, NodeBlockFetcher
 from .models import StageResult
-from .protocol import MessageType, message_name
 from .state_store import StateStore
 from .sync_common import (
     SyncConfig,
@@ -20,7 +19,6 @@ from .sync_common import (
     requested_start_height,
 )
 from .treasury import extract_body_buffers, treasury_payload_sha256
-from .utils import format_address
 
 
 HEADER_REQUEST_BATCH_SIZE = 2048  # kept for backward-compat; not used in staging logic

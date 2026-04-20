@@ -5,10 +5,23 @@ from __future__ import annotations
 import argparse
 import sys
 
-from src.protocol import DEFAULT_CONNECT_TIMEOUT, DEFAULT_PORT, DEFAULT_REQUEST_TIMEOUT
-from src.sync_common import SyncConfig
-from src.sync_pipeline import run_staged
-from src.utils import parse_endpoint, parse_fork_hashes
+from beam_p2p import (
+    DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_PORT,
+    DEFAULT_REQUEST_TIMEOUT,
+    parse_endpoint,
+    parse_fork_hashes,
+)
+
+from src.derive_runner import run_derive
+from src.stage_runner import run_stage
+from src.state_store import StateStore
+from src.sync_common import (
+    DeriveConfig,
+    SyncConfig,
+    raise_if_non_contiguous_start,
+    requested_start_height,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -113,18 +126,47 @@ def main(argv: list[str] | None = None) -> int:
     try:
         endpoint = parse_endpoint(args.node, DEFAULT_PORT)
         fork_hashes = parse_fork_hashes(args.fork_hash)
-        stage_result, derive_result = run_staged(
-            SyncConfig(
-                endpoint=endpoint,
-                state_db_path=args.state_db,
-                connect_timeout=args.connect_timeout,
-                request_timeout=args.request_timeout,
-                fork_hashes=fork_hashes,
-                start_height=args.start_height,
-                stop_height=args.stop_height,
-                progress_every=args.progress_every,
-                fast_sync=args.fast_sync,
-                verbose=args.verbose,
+        
+        config = SyncConfig(
+            endpoint=endpoint,
+            state_db_path=args.state_db,
+            connect_timeout=args.connect_timeout,
+            request_timeout=args.request_timeout,
+            fork_hashes=fork_hashes,
+            start_height=args.start_height,
+            stop_height=args.stop_height,
+            progress_every=args.progress_every,
+            fast_sync=args.fast_sync,
+            verbose=args.verbose,
+        )
+        
+        # Validate sync configuration
+        requested_start = requested_start_height(config.start_height)
+        store = StateStore(config.state_db_path)
+        try:
+            last_synced_height = store.last_synced_height()
+        finally:
+            store.close()
+
+        if config.stop_height is not None and config.stop_height < last_synced_height:
+            raise RuntimeError(
+                f"state DB is already derived through {last_synced_height}, which is past requested stop height {config.stop_height}"
+            )
+        raise_if_non_contiguous_start(
+            requested_start=requested_start,
+            next_height=last_synced_height + 1,
+            mode_name="staged mode",
+            state_name="derived state",
+        )
+        
+        # Run sync pipeline
+        stage_result = run_stage(config)
+        derive_result = run_derive(
+            DeriveConfig(
+                state_db_path=config.state_db_path,
+                start_height=config.start_height,
+                stop_height=config.stop_height,
+                progress_every=config.progress_every,
             )
         )
 

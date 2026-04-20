@@ -5,9 +5,10 @@ from __future__ import annotations
 import sys
 import time
 
-from .deserializers import deserialize_body_pack_payload, deserialize_body_payload
+from beam_p2p import MessageType, message_name
+from beam_p2p.deserializers import deserialize_body_pack_payload, deserialize_body_payload
+
 from .models import DeriveResult
-from .protocol import MessageType, message_name
 from .state_store import StateStore
 from .sync_common import (
     DeriveConfig,

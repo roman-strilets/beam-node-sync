@@ -22,9 +22,8 @@ from .db_models import (
     TreasuryPayloadEntity,
 )
 from .models import StagedBlockRecord
-from .protocol import MessageType
-from .protocol_models import BlockHeader, BlockOutput, DecodedBlock
-from .utils import format_commitment
+from beam_p2p import MessageType, format_commitment
+from beam_p2p.protocol_models import BlockHeader, BlockOutput, DecodedBlock
 
 
 COINBASE_MATURITY = 240

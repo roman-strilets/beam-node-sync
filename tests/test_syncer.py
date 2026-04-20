@@ -2,11 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from src.codec import encode_body_payload, encode_uint
+from beam_p2p import MessageType, encode_body_payload, encode_uint
+from beam_p2p.protocol_models import BlockHeader, DecodedBlock, EcPoint, TxCounts, TxInput
+import src.derive_runner as derive_runner_module
+import src.stage_runner as stage_runner_module
+
 from src.derive_runner import run_derive
 from src.node_fetcher import NodeBlockFetcher
-from src.protocol import MessageType
-from src.protocol_models import BlockHeader, DecodedBlock, EcPoint, TxCounts, TxInput
 from src.stage_runner import StageRunner, run_stage
 from src.state_store import StateStore
 from src.sync_common import (
@@ -38,8 +40,8 @@ def _run_staged(config: SyncConfig):
         state_name="derived state",
     )
 
-    stage_result = run_stage(config)
-    derive_result = run_derive(
+    stage_result = stage_runner_module.run_stage(config)
+    derive_result = derive_runner_module.run_derive(
         DeriveConfig(
             state_db_path=config.state_db_path,
             start_height=config.start_height,

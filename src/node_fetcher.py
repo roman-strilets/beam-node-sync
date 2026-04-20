@@ -6,17 +6,20 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from src.protocol_models import BlockHeader, DecodedBlock
-
-from .codec import encode_get_body_pack_payload, encode_height_range
-from .connection import BeamConnection
-from .deserializers import (
+from beam_p2p import (
+    BeamConnection,
+    MessageType,
+    encode_get_body_pack_payload,
+    encode_height_range,
+    format_address,
+    message_name,
+)
+from beam_p2p.deserializers import (
     deserialize_body_pack_payloads,
     deserialize_body_payload,
     deserialize_header_pack_payloads,
 )
-from .protocol import MessageType, message_name
-from .utils import format_address
+from beam_p2p.protocol_models import BlockHeader, DecodedBlock
 
 
 @dataclass(frozen=True)
@@ -48,7 +51,9 @@ class NodeBlockFetcher:
         verbose: bool,
     ) -> None:
         self.connection = connection
-        self.endpoint = format_address((connection.host, connection.port))
+        host = getattr(connection, "host", "<unknown>")
+        port = getattr(connection, "port", 0)
+        self.endpoint = format_address((str(host), int(port)))
         self.request_timeout = request_timeout
         self.verbose = verbose
 

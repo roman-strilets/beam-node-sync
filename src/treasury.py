@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import hashlib
 
-from .deserializers import split_body_pack_payload
-from .deserializers.core import BufferReader, DeserializationError
-from .deserializers.tx import deserialize_input, deserialize_output
-from .protocol import MessageType, message_name
-from .protocol_models import BlockOutput, TxOutput
+from beam_p2p import MessageType, message_name
+from beam_p2p.deserializers import (
+    BufferReader,
+    DeserializationError,
+    deserialize_input,
+    deserialize_output,
+    split_body_pack_payload,
+)
+from beam_p2p.protocol_models import BlockOutput, TxOutput
 
 
 KERNEL_SUBTYPE_STD = 1
@@ -31,7 +35,8 @@ def extract_body_buffers(message_type: MessageType, payload: bytes) -> tuple[byt
             raise DeserializationError(
                 f"expected one body in {message_name(message_type)}, got {len(bodies)}"
             )
-        return bodies[0]
+        perishable, eternal, _ = bodies[0]
+        return perishable, eternal
 
     raise DeserializationError(
         f"unsupported treasury body message: {message_name(message_type)}"

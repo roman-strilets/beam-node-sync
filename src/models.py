@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .protocol import MessageType
-from .protocol_models import BlockHeader
+from beam_p2p import MessageType
+from beam_p2p.protocol_models import BlockHeader
 
 
 @dataclass(frozen=True)

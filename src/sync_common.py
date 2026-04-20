@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 
-from .protocol import Address, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT
+from beam_p2p import Address, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT
 
 
 @dataclass(frozen=True)
