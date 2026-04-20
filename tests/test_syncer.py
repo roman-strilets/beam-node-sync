@@ -9,8 +9,45 @@ from src.protocol import MessageType
 from src.protocol_models import BlockHeader, DecodedBlock, EcPoint, TxCounts, TxInput
 from src.stage_runner import StageRunner, run_stage
 from src.state_store import StateStore
-from src.sync_common import DeriveConfig, SyncConfig
-from src.sync_pipeline import run_staged
+from src.sync_common import (
+    DeriveConfig,
+    SyncConfig,
+    raise_if_non_contiguous_start,
+    requested_start_height,
+)
+
+
+def _run_staged(config: SyncConfig):
+    """Run the staged Beam sync pipeline from a trusted node into local SQLite state."""
+    requested_start = requested_start_height(config.start_height)
+    store = StateStore(config.state_db_path)
+
+    try:
+        last_synced_height = store.last_synced_height()
+    finally:
+        store.close()
+
+    if config.stop_height is not None and config.stop_height < last_synced_height:
+        raise RuntimeError(
+            f"state DB is already derived through {last_synced_height}, which is past requested stop height {config.stop_height}"
+        )
+    raise_if_non_contiguous_start(
+        requested_start=requested_start,
+        next_height=last_synced_height + 1,
+        mode_name="staged mode",
+        state_name="derived state",
+    )
+
+    stage_result = run_stage(config)
+    derive_result = run_derive(
+        DeriveConfig(
+            state_db_path=config.state_db_path,
+            start_height=config.start_height,
+            stop_height=config.stop_height,
+            progress_every=config.progress_every,
+        )
+    )
+    return stage_result, derive_result
 
 
 class _FakeConnection:
@@ -145,10 +182,10 @@ def test_run_staged_rejects_start_height_past_resume_floor(
             "run_staged should reject an impossible derive resume before staging"
         )
 
-    monkeypatch.setattr("src.sync_pipeline.run_stage", fail_run_stage)
+    monkeypatch.setattr("src.stage_runner.run_stage", fail_run_stage)
 
     with pytest.raises(RuntimeError, match="can only continue from height 2"):
-        run_staged(
+        _run_staged(
             SyncConfig(
                 endpoint=("node.example", 8100),
                 state_db_path=str(db_path),
@@ -420,10 +457,10 @@ def test_run_staged_uses_stage_then_derive(
             "duration_seconds": 2.0,
         })()
 
-    monkeypatch.setattr("src.sync_pipeline.run_stage", fake_run_stage)
-    monkeypatch.setattr("src.sync_pipeline.run_derive", fake_run_derive)
+    monkeypatch.setattr("src.stage_runner.run_stage", fake_run_stage)
+    monkeypatch.setattr("src.derive_runner.run_derive", fake_run_derive)
 
-    stage_result, derive_result = run_staged(
+    stage_result, derive_result = _run_staged(
         SyncConfig(
             endpoint=("node.example", 8100),
             state_db_path=str(tmp_path / "state.sqlite3"),

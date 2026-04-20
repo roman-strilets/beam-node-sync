@@ -201,34 +201,30 @@ class BeamConnection:
         saw_login = False
         while not saw_login:
             message_type, payload = self.recv()
-            if message_type == MessageType.BYE:
-                raise RuntimeError(f"bye after login: {chr(payload[0]) if payload else '?'}")
-            if message_type == MessageType.GET_TIME:
-                self.send_time()
-                continue
-            if message_type == MessageType.TIME:
-                server_time, _ = decode_uint(payload)
-                self._log(f"[*] {node} time offset: {server_time - int(time.time()):+d}s")
-                continue
-            if message_type == MessageType.AUTHENTICATION:
-                self._log(f"[*] {node} <- Authentication")
-                continue
-            if message_type == MessageType.PING:
-                self.send(MessageType.PONG)
-                continue
-            if message_type == MessageType.LOGIN:
-                self._log(f"[*] {node} <- Login")
-                try:
-                    self.peer_fork_hashes, self.peer_login_flags = parse_login_payload(
-                        payload
-                    )
-                except ValueError as exc:
-                    raise RuntimeError(f"invalid Login payload: {exc}") from exc
-                saw_login = True
-                continue
-
-            self._log(f"[*] {node} queued {message_name(message_type)} during login")
-            self._queue_message(message_type, payload)
+            match message_type:
+                case MessageType.BYE:
+                    raise RuntimeError(f"bye after login: {chr(payload[0]) if payload else '?'}")
+                case MessageType.GET_TIME:
+                    self.send_time()
+                case MessageType.TIME:
+                    server_time, _ = decode_uint(payload)
+                    self._log(f"[*] {node} time offset: {server_time - int(time.time()):+d}s")
+                case MessageType.AUTHENTICATION:
+                    self._log(f"[*] {node} <- Authentication")
+                case MessageType.PING:
+                    self.send(MessageType.PONG)
+                case MessageType.LOGIN:
+                    self._log(f"[*] {node} <- Login")
+                    try:
+                        self.peer_fork_hashes, self.peer_login_flags = parse_login_payload(
+                            payload
+                        )
+                    except ValueError as exc:
+                        raise RuntimeError(f"invalid Login payload: {exc}") from exc
+                    saw_login = True
+                case _:
+                    self._log(f"[*] {node} queued {message_name(message_type)} during login")
+                    self._queue_message(message_type, payload)
 
     def close(self) -> None:
         """Send ``Bye`` and close the socket, ignoring close-time send errors."""
