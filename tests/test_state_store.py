@@ -389,7 +389,6 @@ def test_state_store_imports_treasury_outputs_and_reconciles_missing_inputs(
 
         assert import_stats.inserted_outputs == 1
         assert import_stats.reconciled_spends == 1
-        assert store.treasury_imported_payload_hash() == "payload-hash"
 
         row = _inspect_row(
             db_path,
@@ -510,7 +509,7 @@ def test_state_store_bootstraps_headers_and_staged_blocks_schema(tmp_path: Path)
     store = StateStore(str(db_path))
     try:
         tables = {row["name"] for row in _inspect_rows(db_path, "SELECT name FROM sqlite_master WHERE type = 'table'")}
-        assert {"headers", "staged_blocks", "outputs", "missing_inputs", "state_metadata"} <= tables
+        assert {"headers", "staged_blocks", "outputs", "missing_inputs"} <= tables
 
         header_columns = {row["name"] for row in _inspect_rows(db_path, "PRAGMA table_info(headers)")}
         assert "source_node" in header_columns

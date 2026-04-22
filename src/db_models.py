@@ -88,16 +88,6 @@ class MissingInputEntity(Base):
     commitment: Mapped[str] = mapped_column(Text, primary_key=True)
 
 
-class StateMetadataEntity(Base):
-    """Small key/value metadata table."""
-
-    __tablename__ = "state_metadata"
-
-    key: Mapped[str] = mapped_column(Text, primary_key=True)
-    value: Mapped[str] = mapped_column(Text, nullable=False)
-
-
-
 Index("idx_headers_applied_height", HeaderEntity.applied, HeaderEntity.height)
 Index("idx_staged_blocks_hash", StagedBlockEntity.block_hash)
 Index("idx_outputs_unspent", OutputEntity.spent_height, OutputEntity.create_height, OutputEntity.output_id)

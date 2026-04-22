@@ -18,7 +18,6 @@ from .db_models import (
     MissingInputEntity,
     OutputEntity,
     StagedBlockEntity,
-    StateMetadataEntity,
 )
 from .models import StagedBlockRecord
 from beam_p2p import MessageType, format_commitment
@@ -27,7 +26,6 @@ from beam_p2p.protocol_models import BlockHeader, BlockOutput, DecodedBlock
 
 COINBASE_MATURITY = 240
 TREASURY_CREATE_BLOCK_HASH = "00" * 32
-TREASURY_IMPORTED_PAYLOAD_SHA256_KEY = "treasury_imported_payload_sha256"
 
 
 @dataclass(frozen=True)
@@ -131,22 +129,6 @@ class StateStore:
             .limit(1)
         )
 
-    @staticmethod
-    def _get_metadata_in_session(session: Session, key: str) -> str | None:
-        entity = session.get(StateMetadataEntity, key)
-        return None if entity is None else entity.value
-
-    @staticmethod
-    def _set_metadata_in_session(session: Session, key: str, value: str) -> None:
-        session.execute(
-            sqlite_insert(StateMetadataEntity)
-            .values(key=key, value=value)
-            .on_conflict_do_update(
-                index_elements=[StateMetadataEntity.key],
-                set_={"value": value},
-            )
-        )
-
     def last_synced_height(self) -> int:
         with self._read_session() as session:
             return self._last_synced_height_in_session(session)
@@ -205,16 +187,15 @@ class StateStore:
             entity = self._header_entity(session, height)
             return None if entity is None else entity.hash
 
-    def _get_metadata(self, key: str) -> str | None:
+    def treasury_already_imported(self) -> bool:
         with self._read_session() as session:
-            return self._get_metadata_in_session(session, key)
-
-    def _set_metadata(self, key: str, value: str) -> None:
-        with self._write_session() as session:
-            self._set_metadata_in_session(session, key, value)
-
-    def treasury_imported_payload_hash(self) -> str | None:
-        return self._get_metadata(TREASURY_IMPORTED_PAYLOAD_SHA256_KEY)
+            return bool(
+                session.scalar(
+                    select(func.count()).select_from(OutputEntity).where(
+                        OutputEntity.create_height == 0
+                    )
+                )
+            )
 
     def stage_header(
         self,
@@ -545,16 +526,14 @@ class StateStore:
         reconciled_spends = 0
 
         with self._write_session() as session:
-            imported_hash = self._get_metadata_in_session(
-                session,
-                TREASURY_IMPORTED_PAYLOAD_SHA256_KEY,
-            )
-            if imported_hash is not None:
-                if imported_hash != payload_sha256:
-                    raise RuntimeError(
-                        "imported treasury payload hash mismatch: expected "
-                        f"{imported_hash}, got {payload_sha256}"
+            already_imported = bool(
+                session.scalar(
+                    select(func.count()).select_from(OutputEntity).where(
+                        OutputEntity.create_height == 0
                     )
+                )
+            )
+            if already_imported:
                 return TreasuryImportStats(inserted_outputs=0, reconciled_spends=0)
 
             for output in outputs:
@@ -592,12 +571,6 @@ class StateStore:
                         )
                     )
                     reconciled_spends += 1
-
-            self._set_metadata_in_session(
-                session,
-                TREASURY_IMPORTED_PAYLOAD_SHA256_KEY,
-                payload_sha256,
-            )
 
         return TreasuryImportStats(
             inserted_outputs=inserted_outputs,

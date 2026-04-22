@@ -524,7 +524,7 @@ def test_run_stage_and_derive_use_stored_treasury_payload(
 
     store = StateStore(str(db_path))
     try:
-        assert store.treasury_imported_payload_hash() is not None
+        assert store.treasury_already_imported()
     finally:
         store.close()
 

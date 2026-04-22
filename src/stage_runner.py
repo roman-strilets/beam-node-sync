@@ -157,7 +157,7 @@ class StageRunner:
         return eternal
 
     def _import_treasury_if_needed(self) -> None:
-        if self.store.treasury_imported_payload_hash() is not None:
+        if self.store.treasury_already_imported():
             return
 
         payload = self._request_treasury_payload()

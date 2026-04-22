@@ -14,6 +14,7 @@ from beam_p2p import (
 )
 
 from src.derive_runner import run_derive
+from src.models import DeriveResult, StageResult
 from src.stage_runner import run_stage
 from src.state_store import StateStore
 from src.sync_common import (
@@ -22,6 +23,38 @@ from src.sync_common import (
     raise_if_non_contiguous_start,
     requested_start_height,
 )
+
+
+def run_staged(config: SyncConfig) -> tuple[StageResult, DeriveResult]:
+    """Validate configuration, run the stage phase, then the derive phase."""
+    requested_start = requested_start_height(config.start_height)
+    store = StateStore(config.state_db_path)
+    try:
+        last_synced_height = store.last_synced_height()
+    finally:
+        store.close()
+
+    if config.stop_height is not None and config.stop_height < last_synced_height:
+        raise RuntimeError(
+            f"state DB is already derived through {last_synced_height}, which is past requested stop height {config.stop_height}"
+        )
+    raise_if_non_contiguous_start(
+        requested_start=requested_start,
+        next_height=last_synced_height + 1,
+        mode_name="staged mode",
+        state_name="derived state",
+    )
+
+    stage_result = run_stage(config)
+    derive_result = run_derive(
+        DeriveConfig(
+            state_db_path=config.state_db_path,
+            start_height=config.start_height,
+            stop_height=config.stop_height,
+            progress_every=config.progress_every,
+        )
+    )
+    return stage_result, derive_result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -140,35 +173,8 @@ def main(argv: list[str] | None = None) -> int:
             verbose=args.verbose,
         )
         
-        # Validate sync configuration
-        requested_start = requested_start_height(config.start_height)
-        store = StateStore(config.state_db_path)
-        try:
-            last_synced_height = store.last_synced_height()
-        finally:
-            store.close()
-
-        if config.stop_height is not None and config.stop_height < last_synced_height:
-            raise RuntimeError(
-                f"state DB is already derived through {last_synced_height}, which is past requested stop height {config.stop_height}"
-            )
-        raise_if_non_contiguous_start(
-            requested_start=requested_start,
-            next_height=last_synced_height + 1,
-            mode_name="staged mode",
-            state_name="derived state",
-        )
-        
         # Run sync pipeline
-        stage_result = run_stage(config)
-        derive_result = run_derive(
-            DeriveConfig(
-                state_db_path=config.state_db_path,
-                start_height=config.start_height,
-                stop_height=config.stop_height,
-                progress_every=config.progress_every,
-            )
-        )
+        stage_result, derive_result = run_staged(config)
 
         print(
             f"staged height={stage_result.staged_height}/{stage_result.target_height} "
