@@ -2,13 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from beam_p2p import MessageType, encode_body_payload, encode_uint
+from beam_p2p import MessageType, NodeBlockFetcher, encode_body_payload, encode_uint
 from beam_p2p.protocol_models import BlockHeader, DecodedBlock, EcPoint, TxCounts, TxInput
 import src.derive_runner as derive_runner_module
 import src.stage_runner as stage_runner_module
 
 from src.derive_runner import run_derive
-from src.node_fetcher import NodeBlockFetcher
 from src.stage_runner import StageRunner, run_stage
 from src.state_store import StateStore
 from src.sync_common import (
@@ -525,8 +524,7 @@ def test_run_stage_and_derive_use_stored_treasury_payload(
 
     store = StateStore(str(db_path))
     try:
-        assert store.treasury_payload_hash() is not None
-        assert store.treasury_imported_payload_hash() is None
+        assert store.treasury_imported_payload_hash() is not None
     finally:
         store.close()
 

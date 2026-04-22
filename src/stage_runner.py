@@ -6,10 +6,20 @@ import sys
 import time
 from collections.abc import Iterator
 
-from beam_p2p import BeamConnection, MessageType, encode_get_body_pack_payload, format_address, message_name
+from beam_p2p import (
+    BODY_FLAG_FULL,
+    BODY_FLAG_NONE,
+    BODY_FLAG_RECOVERY1,
+    BeamConnection,
+    BodyFetchPlan,
+    MessageType,
+    NodeBlockFetcher,
+    encode_get_body_pack_payload,
+    format_address,
+    message_name,
+)
 from beam_p2p.deserializers import deserialize_new_tip_payload
 
-from .node_fetcher import BODY_FLAG_FULL, BODY_FLAG_NONE, BODY_FLAG_RECOVERY1, BodyFetchPlan, NodeBlockFetcher
 from .models import StageResult
 from .state_store import StateStore
 from .sync_common import (
@@ -18,7 +28,7 @@ from .sync_common import (
     raise_if_start_past_available_height,
     requested_start_height,
 )
-from .treasury import extract_body_buffers, treasury_payload_sha256
+from beam_p2p.treasury import deserialize_treasury_payload, extract_body_buffers, treasury_payload_sha256
 
 
 HEADER_REQUEST_BATCH_SIZE = 2048  # kept for backward-compat; not used in staging logic
@@ -54,7 +64,7 @@ class StageRunner:
 
         try:
             self.target_height = self._resolve_target_height()
-            self._store_treasury_payload_if_needed()
+            self._import_treasury_if_needed()
             self._validate_requested_start()
             self.synced_height = self.store.last_synced_height()
             self.expected_blocks = self._count_missing_blocks()
@@ -146,18 +156,18 @@ class StageRunner:
             raise RuntimeError("treasury response unexpectedly included a perishable payload")
         return eternal
 
-    def _store_treasury_payload_if_needed(self) -> None:
-        if self.store.treasury_payload_hash() is not None:
+    def _import_treasury_if_needed(self) -> None:
+        if self.store.treasury_imported_payload_hash() is not None:
             return
 
         payload = self._request_treasury_payload()
         if payload is None:
             return
 
-        self.store.store_treasury_payload(
-            payload,
-            payload_sha256=treasury_payload_sha256(payload),
-            source_node=self.endpoint,
+        sha256 = treasury_payload_sha256(payload)
+        self.store.import_treasury_outputs(
+            deserialize_treasury_payload(payload),
+            payload_sha256=sha256,
         )
 
     def _count_missing_blocks(self) -> int:

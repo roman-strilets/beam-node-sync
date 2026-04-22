@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from sqlalchemy import (
     Boolean,
-    CheckConstraint,
     Float,
     ForeignKey,
     Index,
@@ -97,19 +96,6 @@ class StateMetadataEntity(Base):
     key: Mapped[str] = mapped_column(Text, primary_key=True)
     value: Mapped[str] = mapped_column(Text, nullable=False)
 
-
-class TreasuryPayloadEntity(Base):
-    """Singleton treasury payload cache."""
-
-    __tablename__ = "treasury_payload"
-    __table_args__ = (
-        CheckConstraint("singleton = 1", name="ck_treasury_payload_singleton"),
-    )
-
-    singleton: Mapped[int] = mapped_column(Integer, primary_key=True)
-    payload_sha256: Mapped[str] = mapped_column(Text, nullable=False)
-    payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-    source_node: Mapped[str] = mapped_column(Text, nullable=False)
 
 
 Index("idx_headers_applied_height", HeaderEntity.applied, HeaderEntity.height)

@@ -16,24 +16,6 @@ from .sync_common import (
     raise_if_start_past_available_height,
     requested_start_height,
 )
-from .treasury import deserialize_treasury_payload
-
-
-def _import_treasury_outputs_if_needed(store: StateStore) -> None:
-    payload_sha256 = store.treasury_payload_hash()
-    if payload_sha256 is None:
-        return
-    if store.treasury_imported_payload_hash() == payload_sha256:
-        return
-
-    payload = store.treasury_payload()
-    if payload is None:
-        return
-
-    store.import_treasury_outputs(
-        deserialize_treasury_payload(payload),
-        payload_sha256=payload_sha256,
-    )
 
 
 def _decode_body_message(message_type: MessageType, payload: bytes, header):
@@ -81,8 +63,6 @@ def run_derive(config: DeriveConfig) -> DeriveResult:
             state_name="derived state",
         )
         start_height = last_synced_height + 1
-
-        _import_treasury_outputs_if_needed(store)
 
         applied_blocks = 0
         outputs_seen = 0

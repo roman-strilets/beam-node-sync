@@ -19,7 +19,6 @@ from .db_models import (
     OutputEntity,
     StagedBlockEntity,
     StateMetadataEntity,
-    TreasuryPayloadEntity,
 )
 from .models import StagedBlockRecord
 from beam_p2p import MessageType, format_commitment
@@ -214,45 +213,8 @@ class StateStore:
         with self._write_session() as session:
             self._set_metadata_in_session(session, key, value)
 
-    def treasury_payload_hash(self) -> str | None:
-        with self._read_session() as session:
-            entity = session.get(TreasuryPayloadEntity, 1)
-            return None if entity is None else entity.payload_sha256
-
-    def treasury_payload(self) -> bytes | None:
-        with self._read_session() as session:
-            entity = session.get(TreasuryPayloadEntity, 1)
-            return None if entity is None else bytes(entity.payload)
-
     def treasury_imported_payload_hash(self) -> str | None:
         return self._get_metadata(TREASURY_IMPORTED_PAYLOAD_SHA256_KEY)
-
-    def store_treasury_payload(
-        self,
-        payload: bytes,
-        *,
-        payload_sha256: str,
-        source_node: str,
-    ) -> None:
-        with self._write_session() as session:
-            entity = session.get(TreasuryPayloadEntity, 1)
-            if entity is not None:
-                existing_hash = entity.payload_sha256
-                if existing_hash != payload_sha256:
-                    raise RuntimeError(
-                        "stored treasury payload hash mismatch: expected "
-                        f"{existing_hash}, got {payload_sha256}"
-                    )
-                return
-
-            session.add(
-                TreasuryPayloadEntity(
-                    singleton=1,
-                    payload_sha256=payload_sha256,
-                    payload=payload,
-                    source_node=source_node,
-                )
-            )
 
     def stage_header(
         self,
@@ -594,13 +556,6 @@ class StateStore:
                         f"{imported_hash}, got {payload_sha256}"
                     )
                 return TreasuryImportStats(inserted_outputs=0, reconciled_spends=0)
-
-            stored_payload = session.get(TreasuryPayloadEntity, 1)
-            if stored_payload is not None and stored_payload.payload_sha256 != payload_sha256:
-                raise RuntimeError(
-                    "stored treasury payload hash mismatch: expected "
-                    f"{stored_payload.payload_sha256}, got {payload_sha256}"
-                )
 
             for output in outputs:
                 commitment = format_commitment(output.commitment)
