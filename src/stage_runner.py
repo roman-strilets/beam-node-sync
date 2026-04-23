@@ -24,7 +24,6 @@ from .models import StageResult
 from .state_store import StateStore
 from .sync_common import (
     SyncConfig,
-    iter_contiguous_height_ranges,
     raise_if_start_past_available_height,
     requested_start_height,
 )
@@ -182,13 +181,9 @@ class StageRunner:
     def _stage_all(self) -> None:
         """Fetch headers and bodies together in a single pass using fetch_blocks."""
         for phase_plan in self._iter_body_fetch_plans():
-            for range_start, range_stop in iter_contiguous_height_ranges(
-                self.store.iter_heights_needing_block_staging(
-                    start_height=phase_plan.start_height,
-                    stop_height=phase_plan.stop_height,
-                ),
-                BODY_REQUEST_BATCH_SIZE,
-            ):
+            range_start = phase_plan.start_height
+            while range_start <= phase_plan.stop_height:
+                range_stop = min(range_start + BODY_REQUEST_BATCH_SIZE - 1, phase_plan.stop_height)
                 batch_plan = BodyFetchPlan(
                     start_height=range_start,
                     stop_height=range_stop,
@@ -199,8 +194,6 @@ class StageRunner:
                     horizon_hi1=phase_plan.horizon_hi1,
                 )
                 blocks = self.fetcher.fetch_blocks(
-                    start_height=range_start,
-                    stop_height=range_stop,
                     plan=batch_plan,
                 )
                 for block in blocks:
@@ -214,6 +207,7 @@ class StageRunner:
                     )
                     self.staged_blocks += 1
                     self._report_staged_block(block.header.height)
+                range_start = range_stop + 1
 
     def _report_staged_block(self, height: int) -> None:
         if (

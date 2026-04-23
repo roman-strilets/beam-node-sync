@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 
 from beam_p2p import Address, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT
@@ -67,49 +66,3 @@ def raise_if_non_contiguous_start(
             f"and can only continue from height {next_height}, not requested start height {requested_start}"
         )
 
-
-def batched(items: Iterable, batch_size: int) -> Iterator[list]:
-    """Yield lists of up to ``batch_size`` items from ``items``."""
-    batch: list = []
-    for item in items:
-        batch.append(item)
-        if len(batch) >= batch_size:
-            yield batch
-            batch = []
-    if batch:
-        yield batch
-
-
-def iter_contiguous_height_ranges(
-    heights: Iterable[int],
-    batch_size: int,
-) -> Iterator[tuple[int, int]]:
-    """Yield contiguous height ranges capped at ``batch_size`` items each."""
-    if batch_size <= 0:
-        raise ValueError(f"batch_size must be > 0, got {batch_size}")
-
-    start_height: int | None = None
-    previous_height: int | None = None
-    count = 0
-
-    for height in heights:
-        if start_height is None:
-            start_height = height
-            previous_height = height
-            count = 1
-            continue
-
-        assert previous_height is not None
-        if height != previous_height + 1 or count >= batch_size:
-            yield start_height, previous_height
-            start_height = height
-            previous_height = height
-            count = 1
-            continue
-
-        previous_height = height
-        count += 1
-
-    if start_height is not None:
-        assert previous_height is not None
-        yield start_height, previous_height
