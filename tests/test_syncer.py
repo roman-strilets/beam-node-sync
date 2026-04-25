@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from beam_p2p import MessageType, NodeBlockFetcher, encode_body_payload, encode_uint
+from beam_p2p import MessageType, NodeQueryClient, encode_body_payload, encode_uint
 from beam_p2p.protocol_models import BlockHeader, DecodedBlock, EcPoint, TxCounts, TxInput
 import src.derive_runner as derive_runner_module
 import src.stage_runner as stage_runner_module
@@ -232,8 +232,8 @@ def test_run_stage_allows_fresh_sparse_range(
         )
         return MessageType.BODY_PACK, _empty_body_pack_payload(len(headers))
 
-    monkeypatch.setattr(NodeBlockFetcher, "request_headers", fake_request_headers)
-    monkeypatch.setattr(NodeBlockFetcher, "request_body_range_payload", fake_request_body_range_payload)
+    monkeypatch.setattr(NodeQueryClient, "request_headers", fake_request_headers)
+    monkeypatch.setattr(NodeQueryClient, "request_body_range_payload", fake_request_body_range_payload)
 
     result = run_stage(
         SyncConfig(
@@ -301,8 +301,8 @@ def test_run_stage_fetches_missing_bodies_in_requested_range(
         requested_body_ranges.append((headers[0].height, headers[-1].height))
         return MessageType.BODY_PACK, _empty_body_pack_payload(len(headers))
 
-    monkeypatch.setattr(NodeBlockFetcher, "request_headers", fake_request_headers)
-    monkeypatch.setattr(NodeBlockFetcher, "request_body_range_payload", fake_request_body_range_payload)
+    monkeypatch.setattr(NodeQueryClient, "request_headers", fake_request_headers)
+    monkeypatch.setattr(NodeQueryClient, "request_body_range_payload", fake_request_body_range_payload)
 
     result = run_stage(
         SyncConfig(
@@ -360,8 +360,8 @@ def test_run_stage_fast_sync_uses_sparse_then_full_body_ranges(
         return payload_type, payload
 
     monkeypatch.setattr(StageRunner, "_wait_for_tip_header", lambda self: _header(6, f"{5:064x}"))
-    monkeypatch.setattr(NodeBlockFetcher, "request_headers", fake_request_headers)
-    monkeypatch.setattr(NodeBlockFetcher, "request_body_range_payload", fake_request_body_range_payload)
+    monkeypatch.setattr(NodeQueryClient, "request_headers", fake_request_headers)
+    monkeypatch.setattr(NodeQueryClient, "request_body_range_payload", fake_request_body_range_payload)
 
     result = run_stage(
         SyncConfig(
@@ -500,12 +500,12 @@ def test_run_stage_and_derive_use_stored_treasury_payload(
         lambda self: _treasury_payload(treasury_commitment),
     )
     monkeypatch.setattr(
-        NodeBlockFetcher,
+        NodeQueryClient,
         "request_headers",
         lambda self, *, start_height, stop_height: [header],
     )
     monkeypatch.setattr(
-        NodeBlockFetcher,
+        NodeQueryClient,
         "request_body_range_payload",
         lambda self, *, headers, plan: (MessageType.BODY, _body_payload_with_input(treasury_commitment)),
     )

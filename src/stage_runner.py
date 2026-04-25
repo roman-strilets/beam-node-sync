@@ -13,7 +13,7 @@ from beam_p2p import (
     BeamConnection,
     BodyFetchPlan,
     MessageType,
-    NodeBlockFetcher,
+    NodeQueryClient,
     encode_get_body_pack_payload,
     format_address,
     message_name,
@@ -46,7 +46,7 @@ class StageRunner:
         self.requested_start = requested_start_height(config.start_height)
         self.store = StateStore(config.state_db_path)
         self.connection = self._open_connection()
-        self.fetcher = NodeBlockFetcher(
+        self.fetcher = NodeQueryClient(
             self.connection,
             request_timeout=config.request_timeout,
             verbose=config.verbose,
